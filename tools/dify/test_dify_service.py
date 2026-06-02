@@ -4,21 +4,15 @@ import os
 import sys
 from pathlib import Path
 
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    load_dotenv = None
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-
+import core.config  # noqa: F401 - loads project .env
 from services.dify_service import DifyService
 
 
 def main() -> None:
-    if load_dotenv is not None:
-        load_dotenv(ROOT / ".env")
-
     service = DifyService(
         os.getenv("DIFY_BASE_URL", ""),
         os.getenv("DIFY_API_KEY", ""),

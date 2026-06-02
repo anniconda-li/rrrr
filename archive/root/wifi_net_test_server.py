@@ -26,14 +26,10 @@ import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 
-try:
-    from dotenv import load_dotenv
-except ImportError:  # pragma: no cover - optional until dependencies are installed
-    load_dotenv = None
-
+import core.config  # noqa: F401 - loads project .env
 from services.dify_service import DifyService
 from services.tour_orchestrator import TourOrchestrator
-from services.tts_service import ERROR_TEXT, synthesize_wav_16k
+from services.tts_service import ERROR_TEXT, synthesize_fallback_wav_16k
 
 
 MAGIC = b"WTK1"
@@ -51,8 +47,8 @@ SERVER_DEVICE = b"server-echo"
 DEFAULT_BIND_HOST = "0.0.0.0"
 DEFAULT_UDP_PORT = 9000
 DEFAULT_HTTP_PORT = 8000
-DEFAULT_WAV_SAVE_DIR = Path("tools/received_wav")
-DEFAULT_JPG_SAVE_DIR = Path("tools/received_jpg")
+DEFAULT_WAV_SAVE_DIR = Path("tmp/received_wav")
+DEFAULT_JPG_SAVE_DIR = Path("tmp/received_jpg")
 DEFAULT_CHUNK_SIZE = 32768
 DEFAULT_AI_REPLY_REPEAT = 1
 DEFAULT_AI_REPLY_EXTRA_CHUNK = False
@@ -438,9 +434,6 @@ def create_http_app(
     ai_reply_repeat: int,
     ai_reply_extra_chunk: bool,
 ) -> FastAPI:
-    if load_dotenv is not None:
-        load_dotenv()
-
     app = FastAPI(title="Walkie Talkie Test Server")
     app.state.save_dir = wav_save_dir
     app.state.jpg_save_dir = jpg_save_dir
@@ -545,12 +538,12 @@ def create_http_app(
         except Exception as exc:
             log(f"AI orchestration failed session={session}: {exc}")
             answer_text = ERROR_TEXT
-            reply = synthesize_wav_16k(answer_text)
+            reply = synthesize_fallback_wav_16k(answer_text)
 
         if parse_wav(reply) is None:
             log(f"AI orchestration produced invalid WAV session={session}; using fallback")
             answer_text = ERROR_TEXT
-            reply = synthesize_wav_16k(answer_text)
+            reply = synthesize_fallback_wav_16k(answer_text)
         if parse_wav(reply) is None:
             raise HTTPException(status_code=500, detail={"ok": False, "error": "invalid reply wav"})
 
