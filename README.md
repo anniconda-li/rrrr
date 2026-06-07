@@ -24,7 +24,7 @@ tools/      正式工具脚本：清理 tmp、构建知识库、检查参考图
 tmp/        运行时临时产物，可清理
 ```
 
-`tmp/` 只保存运行时文件，长期保留的图片、音频样本放到 `tests/data/`，文物资料放到 `knowledge/`。
+`tmp/` 只保存运行时文件，长期保留的测试图片、测试音频放到 `tests/data/camera/` 和 `tests/data/audio/`，文物资料放到 `knowledge/`。
 
 ## 环境配置
 
@@ -279,6 +279,7 @@ tmp/debug/
 
 - 不要提交 `.env` 或真实 API Key。
 - `tmp/` 可清理，只放运行时产物。
-- `tests/data/` 放测试样本。
+- `tests/data/camera/` 放预置测试图片。
+- `tests/data/audio/` 放预置测试音频。
 - `knowledge/` 放知识库资料和标准参考图片。
 - 百炼回答里的具体文物名称必须来自知识库标准名称或别名，不能由后端或视觉模型自造名称。

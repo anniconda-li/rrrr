@@ -8,13 +8,13 @@ from datetime import datetime
 from pathlib import Path
 
 import core.config  # noqa: F401 - loads project .env
-from core.paths import TMP_AUDIO_RECEIVED_DIR, TMP_DEBUG_AUDIO_DIR
+from core.paths import TEST_AUDIO_DIR, TMP_DEBUG_AUDIO_DIR
 from services.asr_service import transcribe_wav
 from services.bailian_app_service import BailianAppService, FALLBACK_TEXT
 from services.tts_service import synthesize_wav_16k
 
 
-DEFAULT_WAV_PATH = TMP_AUDIO_RECEIVED_DIR / "ai_upload_20260602_180749_401127.wav"
+DEFAULT_WAV_PATH = TEST_AUDIO_DIR / "sample_ai_upload_20260531_124142_554048.wav"
 DEFAULT_OUTPUT_DIR = TMP_DEBUG_AUDIO_DIR
 DEFAULT_DEVICE = "debug-server"
 DEFAULT_SPOT_ID = "dayanta"

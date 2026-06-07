@@ -11,6 +11,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import core.config  # noqa: F401 - loads project .env
+from core.paths import TMP_DEBUG_AUDIO_DIR
 from services.asr_service import transcribe_wav
 from services.bailian_app_service import BailianAppService
 from services.tts_service import synthesize_wav_16k
@@ -18,7 +19,7 @@ from services.tts_service import synthesize_wav_16k
 
 DEFAULT_QUESTION = "大雁塔有什么故事？"
 MOCK_BAILIAN_ANSWER = "大雁塔是西安著名古迹，始建于唐代，最初用于保存玄奘从印度带回的佛经和佛像。"
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "tmp" / "latest"
+DEFAULT_OUTPUT_DIR = TMP_DEBUG_AUDIO_DIR / "audio_loop"
 
 
 def validate_esp_wav(path: Path) -> dict[str, object]:
