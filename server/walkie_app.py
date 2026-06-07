@@ -33,17 +33,15 @@ from core.paths import (
     DEFAULT_CAMERA_TEST_IMAGE,
     TMP_AUDIO_RECEIVED_WAV_DIR,
     TMP_AUDIO_REPLY_WAV_DIR,
-    TMP_CAMERA_LATEST_DIR,
     TMP_CAMERA_RECEIVED_DIR,
     ensure_runtime_dirs,
     env_path,
 )
-from routers.photo import router as photo_router
 from services.bailian_app_service import BailianAppService
-from services.camera_guide_debug_service import run_camera_guide_debug_test
+from server.camera_guide_debug import run_camera_guide_test
 from services.photo_guide_service import PhotoGuideService, RETAKE_MODE, choose_mode, response_payload
 from services.asr_service import transcribe_wav
-from services.tour_orchestrator import FIXED_ANSWER, TourOrchestrator
+from services.voice_qa_service import FIXED_ANSWER, VoiceQaService
 from services.tts_service import ERROR_TEXT, synthesize_wav_16k
 from services.vision_service import VisionObservation, VisionService
 
@@ -470,7 +468,6 @@ def create_http_app(
 ) -> FastAPI:
     ensure_runtime_dirs()
     app = FastAPI(title="WTK1 Backend")
-    app.include_router(photo_router)
     app.state.save_dir = wav_save_dir
     app.state.jpg_save_dir = jpg_save_dir
     app.state.ai_sessions = {}
@@ -480,10 +477,10 @@ def create_http_app(
     app.state.ai_reply_repeat = max(ai_reply_repeat, 1)
     app.state.ai_reply_extra_chunk = ai_reply_extra_chunk
     app.state.reply_save_dir = env_path("REPLY_WAV_SAVE_DIR", TMP_AUDIO_REPLY_WAV_DIR)
-    app.state.latest_dir = env_path("LATEST_TMP_DIR", TMP_CAMERA_LATEST_DIR)
+    app.state.latest_reply_dir = env_path("LATEST_TMP_DIR", app.state.reply_save_dir)
     bailian_app_service = BailianAppService()
     app.state.bailian_app_service = bailian_app_service
-    app.state.tour_orchestrator = TourOrchestrator(bailian_app_service)
+    app.state.voice_qa_service = VoiceQaService(bailian_app_service)
     app.state.vision_service = VisionService()
     app.state.photo_guide_service = PhotoGuideService(bailian_app_service)
 
@@ -578,8 +575,8 @@ def create_http_app(
             app.state.reply_save_dir.mkdir(parents=True, exist_ok=True)
             reply_path = app.state.reply_save_dir / f"reply_{session_id}.wav"
             reply_path.write_bytes(reply)
-            app.state.latest_dir.mkdir(parents=True, exist_ok=True)
-            (app.state.latest_dir / "reply.wav").write_bytes(reply)
+            app.state.latest_reply_dir.mkdir(parents=True, exist_ok=True)
+            (app.state.latest_reply_dir / "latest_reply.wav").write_bytes(reply)
             log(f"[AI-TIME] write_reply={time.perf_counter() - write_start:.3f}s reply_wav={reply_path}")
 
             with app.state.ai_sessions_lock:
@@ -688,7 +685,7 @@ def create_http_app(
 
         try:
             answer_text = await asyncio.to_thread(
-                app.state.tour_orchestrator._ask_llm,
+                app.state.voice_qa_service._ask_llm,
                 asr_text,
                 device=ai_session.device,
                 spot_id=spot_id,
@@ -711,7 +708,7 @@ def create_http_app(
 
     @app.get("/debug/camera_guide/test")
     async def debug_camera_guide_test() -> JSONResponse:
-        result = await run_camera_guide_debug_test(
+        result = await run_camera_guide_test(
             vision_service=app.state.vision_service,
             bailian_app_service=app.state.bailian_app_service,
             test_image_path=DEFAULT_CAMERA_TEST_IMAGE,

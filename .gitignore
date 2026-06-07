@@ -29,14 +29,19 @@ logs/
 *.jpeg
 *.png
 
-# Keep curated received samples
-!samples/
-!samples/received_wav/
-!samples/received_wav/*.wav
-!samples/received_jpg/
-!samples/received_jpg/*.jpg
-!samples/received_jpg/*.jpeg
-!samples/received_jpg/*.png
+# Keep curated test data
+!tests/
+!tests/data/
+!tests/data/received_wav/
+!tests/data/received_wav/*.wav
+!tests/data/received_jpg/
+!tests/data/received_jpg/*.jpg
+!tests/data/received_jpg/*.jpeg
+!tests/data/received_jpg/*.png
+!tests/data/camera/
+!tests/data/camera/*.jpg
+!tests/data/camera/*.jpeg
+!tests/data/camera/*.png
 
 # Local editor and OS files
 .idea/

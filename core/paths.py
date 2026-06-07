@@ -7,31 +7,36 @@ from pathlib import Path
 from core.config import PROJECT_ROOT
 
 
-DATA_DIR = PROJECT_ROOT / "data"
-MUSEUM_REFS_DIR = DATA_DIR / "museum_refs"
-KNOWLEDGE_EXPORT_DIR = DATA_DIR / "knowledge_export"
-KNOWLEDGE_DOCS_DIR = PROJECT_ROOT / "knowledge_docs"
-EXHIBITS_KNOWLEDGE_DIR = KNOWLEDGE_DOCS_DIR / "exhibits"
-CONFIG_DIR = PROJECT_ROOT / "config"
+KNOWLEDGE_DIR = PROJECT_ROOT / "knowledge"
+KNOWLEDGE_CONFIG_DIR = KNOWLEDGE_DIR / "config"
+MUSEUM_REFS_DIR = KNOWLEDGE_DIR / "refs"
+EXHIBITS_KNOWLEDGE_DIR = KNOWLEDGE_DIR / "exhibits"
+CONFIG_DIR = KNOWLEDGE_CONFIG_DIR
+TESTS_DIR = PROJECT_ROOT / "tests"
+TEST_DATA_DIR = TESTS_DIR / "data"
+TEST_CAMERA_DIR = TEST_DATA_DIR / "camera"
 
 TMP_DIR = PROJECT_ROOT / "tmp"
 
 TMP_CAMERA_DIR = TMP_DIR / "camera"
 TMP_CAMERA_RECEIVED_DIR = TMP_CAMERA_DIR / "received"
-TMP_CAMERA_LATEST_DIR = TMP_CAMERA_DIR / "latest"
-TMP_CAMERA_TEST_DIR = TMP_CAMERA_DIR / "test"
 TMP_CAMERA_PREPROCESS_DIR = TMP_CAMERA_DIR / "preprocess"
 
 TMP_AUDIO_DIR = TMP_DIR / "audio"
-TMP_AUDIO_RECEIVED_WAV_DIR = TMP_AUDIO_DIR / "received_wav"
-TMP_AUDIO_REPLY_WAV_DIR = TMP_AUDIO_DIR / "reply_wav"
-TMP_AUDIO_DEBUG_REPLY_WAV_DIR = TMP_AUDIO_DIR / "debug_reply_wav"
+TMP_AUDIO_RECEIVED_DIR = TMP_AUDIO_DIR / "received"
+TMP_AUDIO_REPLIES_DIR = TMP_AUDIO_DIR / "replies"
 
-TMP_RUNS_DIR = TMP_DIR / "runs"
 TMP_DEBUG_DIR = TMP_DIR / "debug"
+TMP_DEBUG_AUDIO_DIR = TMP_DEBUG_DIR / "audio"
 
-# Legacy tmp paths kept only as constants for old callers. Runtime code should
-# use the normalized tmp/camera, tmp/audio, tmp/runs, and tmp/debug structure.
+# Backwards-compatible names for existing imports. New code should use
+# TMP_AUDIO_RECEIVED_DIR and TMP_AUDIO_REPLIES_DIR.
+TMP_AUDIO_RECEIVED_WAV_DIR = TMP_AUDIO_RECEIVED_DIR
+TMP_AUDIO_REPLY_WAV_DIR = TMP_AUDIO_REPLIES_DIR
+TMP_AUDIO_DEBUG_REPLY_WAV_DIR = TMP_DEBUG_AUDIO_DIR
+
+# Legacy tmp paths kept only as constants for old callers and one-time
+# migration. Runtime code should use tmp/camera, tmp/audio, and tmp/debug.
 LEGACY_CAMERA_PREPROCESS_DIR = TMP_DIR / "camera_preprocess"
 LEGACY_CAMERA_PREPROCESS_TEST_DIR = TMP_DIR / "camera_preprocess_test"
 LEGACY_LATEST_DIR = TMP_DIR / "latest"
@@ -43,11 +48,13 @@ LEGACY_DEBUG_REPLY_WAV_DIR = TMP_DIR / "debug_reply_wav"
 LEGACY_TEST_AI_CANCEL_DIR = TMP_DIR / "test_ai_cancel"
 LEGACY_TEST_JPG_DIR = TMP_DIR / "test_jpg"
 LEGACY_CAMERA_TEST_IMAGE = LEGACY_RECEIVED_JPG_DIR / "camera_upload_20260603_165431_081287.jpg"
+LEGACY_NORMALIZED_CAMERA_TEST_IMAGE = TMP_CAMERA_DIR / "test" / "camera_upload_20260603_165431_081287.jpg"
+LEGACY_NAMED_TEST_IMAGE = TMP_CAMERA_DIR / "test" / "test_exhibit.jpg"
 
 DEFAULT_CAMERA_TEST_IMAGE = Path(
     os.getenv(
         "DEFAULT_CAMERA_TEST_IMAGE",
-        str(TMP_CAMERA_TEST_DIR / "camera_upload_20260603_165431_081287.jpg"),
+        str(TEST_CAMERA_DIR / "test_exhibit.jpg"),
     )
 )
 if not DEFAULT_CAMERA_TEST_IMAGE.is_absolute():
@@ -55,13 +62,9 @@ if not DEFAULT_CAMERA_TEST_IMAGE.is_absolute():
 
 RUNTIME_DIRS = (
     TMP_CAMERA_RECEIVED_DIR,
-    TMP_CAMERA_LATEST_DIR,
-    TMP_CAMERA_TEST_DIR,
     TMP_CAMERA_PREPROCESS_DIR,
-    TMP_AUDIO_RECEIVED_WAV_DIR,
-    TMP_AUDIO_REPLY_WAV_DIR,
-    TMP_AUDIO_DEBUG_REPLY_WAV_DIR,
-    TMP_RUNS_DIR,
+    TMP_AUDIO_RECEIVED_DIR,
+    TMP_AUDIO_REPLIES_DIR,
     TMP_DEBUG_DIR,
 )
 
@@ -70,17 +73,18 @@ MUSEUM_REF_IDS = (
     "panlongniu_daigai_tonghe",
     "denggong_gui",
     "lushan_huaci_sanzuxi",
-    "junyao_tianqingyou_bo",
     "shuyao_chuilinwen_shengding",
 )
 
 PROJECT_DIRS = (
-    DATA_DIR,
+    KNOWLEDGE_DIR,
+    KNOWLEDGE_CONFIG_DIR,
     MUSEUM_REFS_DIR,
-    KNOWLEDGE_EXPORT_DIR,
-    KNOWLEDGE_DOCS_DIR,
     EXHIBITS_KNOWLEDGE_DIR,
     CONFIG_DIR,
+    TESTS_DIR,
+    TEST_DATA_DIR,
+    TEST_CAMERA_DIR,
     *(MUSEUM_REFS_DIR / ref_id for ref_id in MUSEUM_REF_IDS),
     *RUNTIME_DIRS,
 )
@@ -111,12 +115,20 @@ def ensure_runtime_dirs() -> None:
 
 def ensure_default_camera_test_image() -> dict[str, object]:
     target = DEFAULT_CAMERA_TEST_IMAGE
-    source = LEGACY_CAMERA_TEST_IMAGE
+    source_candidates = (
+        LEGACY_NAMED_TEST_IMAGE,
+        LEGACY_NORMALIZED_CAMERA_TEST_IMAGE,
+        LEGACY_CAMERA_TEST_IMAGE,
+    )
     copied = False
     target.parent.mkdir(parents=True, exist_ok=True)
-    if not target.exists() and source.exists():
-        shutil.copy2(source, target)
-        copied = True
+    source = next((path for path in source_candidates if path.exists()), source_candidates[-1])
+    if not target.exists():
+        existing_source = next((path for path in source_candidates if path.exists()), None)
+        if existing_source is not None:
+            shutil.copy2(existing_source, target)
+            source = existing_source
+            copied = True
     info = {
         "source_test_image": str(source),
         "target_test_image": str(target),

@@ -13,7 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import core.config  # noqa: E402,F401 - loads project .env
 from core.paths import DEFAULT_CAMERA_TEST_IMAGE, ensure_project_dirs
 from services.bailian_app_service import BailianAppService
-from services.camera_guide_debug_service import DEFAULT_CAMERA_GUIDE_TEST_TEXT, run_camera_guide_debug_test
+from server.camera_guide_debug import DEFAULT_CAMERA_GUIDE_TEST_TEXT, run_camera_guide_test
 from services.vision_service import VisionService
 
 
@@ -33,7 +33,7 @@ def main() -> int:
 
     ensure_project_dirs()
     result = asyncio.run(
-        run_camera_guide_debug_test(
+        run_camera_guide_test(
             vision_service=VisionService(),
             bailian_app_service=BailianAppService(),
             test_image_path=Path(args.image),

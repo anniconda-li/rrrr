@@ -1,38 +1,34 @@
 # WKT1 AI Guide Backend
 
-ESP32S3 AI 对讲导游设备的本地后端测试项目。
+ESP32S3 AI 对讲导游设备的本地 FastAPI 后端。
 
-设备侧负责录音、拍照、上传 WAV/JPG、拉取回复 WAV 并播放；后端负责 ASR、百炼智能体应用调用、TTS 和 WAV 格式转换。百炼智能体应用负责景区导游知识库 RAG 和文本回答，不处理音频和设备协议。
-
-## 当前主测试
-
-完整本地 AI 音频闭环：
+当前项目已经完成三条核心链路的本地验证：
 
 ```text
-问题文本 -> TTS -> ASR -> 百炼智能体应用 -> TTS -> reply.wav
+1. UDP 实时音频对讲
+2. 语音问答：WAV -> ASR -> 百炼知识库 -> TTS -> WAV
+3. 图片问答：JPG -> 视觉描述 -> 百炼知识库 -> 文本/语音回答
 ```
 
-运行：
+设备侧负责录音、拍照、上传 WAV/JPG、拉取回复 WAV 并播放。后端负责设备协议接收、ASR、视觉识别、百炼应用调用、TTS 和运行时文件管理。百炼应用负责文物知识库检索和文本回答。
 
-```powershell
-python tools\audio\test_ai_audio_loop.py --text "大雁塔有什么故事？"
-```
-
-不接真实百炼，使用 mock 回答：
-
-```powershell
-python tools\audio\test_ai_audio_loop.py --text "大雁塔有什么故事？" --mock-bailian
-```
-
-生成结果在：
+## 目录结构
 
 ```text
-tmp/latest/reply.wav
+core/       项目基础配置：加载 .env、统一路径常量、创建运行目录
+server/     FastAPI/UDP 服务入口和设备协议处理
+services/   正式业务能力：ASR、TTS、百炼、视觉、语音问答、拍照问答
+knowledge/  文物知识库资料：参考图、候选配置、每件文物 Markdown
+tests/      测试脚本和测试数据
+tools/      正式工具脚本：清理 tmp、构建知识库、检查参考图
+tmp/        运行时临时产物，可清理
 ```
+
+`tmp/` 只保存运行时文件，长期保留的图片、音频样本放到 `tests/data/`，文物资料放到 `knowledge/`。
 
 ## 环境配置
 
-复制 `.env.example` 为 `.env`，并填入真实 Key：
+创建 `.env`：
 
 ```powershell
 copy .env.example .env
@@ -52,18 +48,97 @@ ASR_MODEL=paraformer-realtime-v2
 VISION_PROVIDER=dashscope
 VISION_MODEL=qwen-vl-plus
 
-AUTO_TTS_BACKGROUND=true
 BAILIAN_API_KEY=your_bailian_api_key
 BAILIAN_APP_ID=your_bailian_app_id
 BAILIAN_APP_BASE_URL=https://dashscope.aliyuncs.com
 BAILIAN_TIMEOUT=15
+AUTO_TTS_BACKGROUND=true
 ```
 
 项目入口会通过 `core/config.py` 自动加载根目录 `.env`。
 
-## ESP32S3 客户端交互逻辑
+安装依赖：
 
-拍照上传现在是“保存图片 + 同步完成初步图像识别”的动作。客户端上传图片后，需要等待 `/camera/upload` 返回，再决定是否允许用户进入语音提问。
+```powershell
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+本机还需要可运行 `ffmpeg`，用于把 TTS 音频转换为设备可播放格式：
+
+```text
+16000Hz / 16-bit / mono / PCM / WAV
+```
+
+## 启动服务
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+服务启动后：
+
+```text
+HTTP: http://<PC_LAN_IP>:8000
+UDP:  9000
+```
+
+ESP32S3 固件中的 HTTP 地址应指向这台电脑的局域网 IP。
+
+## 实时对讲
+
+后端保留 UDP WTK1 数据包接收和同设备音频回传能力，用于实时音频对讲测试。
+
+默认端口：
+
+```text
+UDP 9000
+```
+
+设备侧需要保持 WTK1 UDP 协议格式。后端会记录注册、频道、PTT、音频、心跳等包，并可做本地回声测试。
+
+## 语音问答
+
+设备语音问答流程：
+
+```text
+POST /ai/start
+POST /ai/upload
+POST /ai/finish
+POST /ai/result_info
+POST /ai/result_chunk
+```
+
+后端处理流程：
+
+```text
+上传 WAV
+-> ASR 转文字
+-> 判断是否是图片相关问题
+-> 普通问题走百炼知识库
+-> TTS 合成回复 WAV
+-> 设备分片下载播放
+```
+
+本地完整音频闭环测试：
+
+```powershell
+python tests\scripts\audio_loop.py --text "大雁塔有什么故事？"
+```
+
+使用 mock 百炼回答：
+
+```powershell
+python tests\scripts\audio_loop.py --text "大雁塔有什么故事？" --mock-bailian
+```
+
+单独测试百炼应用：
+
+```powershell
+python tests\scripts\bailian_app.py
+```
+
+## 图片问答
 
 图片上传接口：
 
@@ -73,13 +148,9 @@ Content-Type: image/jpeg
 Body: JPEG bytes
 ```
 
-如果后端返回 `ok=true` 且 `analysis_ok=true`，表示图片已经完成初步图像分析，客户端可以提示用户开始提问：
+图片上传不是单纯保存文件。后端会同步完成初步视觉分析，并返回是否可以进入语音提问。
 
-```text
-已完成图像分析，可以提问了。
-```
-
-典型返回：
+成功且可提问：
 
 ```json
 {
@@ -88,15 +159,13 @@ Body: JPEG bytes
   "device": "walkie-01",
   "image_id": "camera_upload_...",
   "scene_type": "展柜展品",
-  "object_category": "陶瓷",
+  "object_category": "玉器",
   "mode": "category_guide",
   "need_retake": false
 }
 ```
 
-如果后端返回 `ok=true` 但 `analysis_ok=false`，表示这张照片信息不够，客户端不要进入语音提问流程，应提示用户重拍。提示语优先使用后端返回的 `answer_text`。
-
-典型返回：
+照片不够清楚时：
 
 ```json
 {
@@ -108,90 +177,108 @@ Body: JPEG bytes
 }
 ```
 
-如果后端返回 `ok=false`，客户端按上传失败处理，可以提示网络或图片上传异常，并允许用户重试拍照。
-
-客户端状态机建议：
+客户端建议状态机：
 
 ```text
 idle
-  -> 用户拍照
-  -> uploading_photo
-  -> 等待 /camera/upload 返回
+-> 用户拍照
+-> uploading_photo
+-> 等待 /camera/upload 返回
 
 ok=false
-  -> 提示上传失败
-  -> 回到 idle
+-> 提示上传失败
+-> 回到 idle
 
 ok=true 且 analysis_ok=false
-  -> 播放或显示 answer_text
-  -> 要求用户重拍
-  -> 回到 idle
+-> 播放或显示 answer_text
+-> 要求用户重拍
+-> 回到 idle
 
 ok=true 且 analysis_ok=true
-  -> 设置 camera_ready=true
-  -> 提示“已完成图像分析，可以提问了。”
-  -> 等待用户按语音键提问
+-> 设置 camera_ready=true
+-> 提示“已完成图像分析，可以提问了。”
+-> 等待用户按语音键提问
 ```
 
-用户随后语音提问仍走原来的 AI 语音流程：
+用户随后继续走语音问答接口。后端会判断用户是否在问刚才拍的图片，例如：
 
 ```text
-POST /ai/start
-POST /ai/upload
-POST /ai/finish
-POST /ai/result_info
-POST /ai/result_chunk
+这是什么
+讲讲这个展品
+刚才拍的是什么
 ```
 
-后端会在 ASR 后判断用户是否在问刚才拍的图片，例如“这是什么”“讲讲这个展品”“刚才拍的是什么”。如果是图片相关问题，后端会使用 `/camera/upload` 时缓存的视觉识别结果回答，不会重复识别图片。如果是普通导游问题，则继续走原来的百炼语音问答。
+如果是图片相关问题，后端会使用 `/camera/upload` 时缓存的视觉识别结果回答，不会重复识别图片。如果是普通导游问题，则继续走普通语音问答。
 
-客户端不需要调用 `/camera/analyze_latest`。该接口仅作为后端调试入口保留。
-
-## 依赖
+固定图片 + 固定问题测试：
 
 ```powershell
-.\.venv\Scripts\activate
-pip install -r requirements.txt
+python tests\scripts\camera_guide.py --image tests\data\camera\test_exhibit.jpg --text "这是什么"
 ```
 
-还需要本机可运行 `ffmpeg`，用于把 TTS 音频转换为 ESP32S3 可播放格式：
+这个测试会输出：
 
 ```text
-16000Hz / 16-bit / mono / PCM / WAV
+vision_result
+rewritten_prompt
+bailian_answer
+timing
 ```
 
-## 目录结构
+可以用它检查视觉描述、发给百炼的 prompt 和最终回答是否符合预期。
 
-- `services/`：正式服务能力，包括 ASR、TTS、百炼智能体应用、Vision 占位。
-- `tools/`：当前常用本地测试和维护脚本。
-- `samples/received_wav/`：真实客户端上传 WAV 样本。
-- `samples/received_jpg/`：真实客户端上传 JPG 样本。
-- `tmp/`：运行时临时产物，可随时清理。
-- `docs/`：项目阶段记录。
-- `archive/`：已归档的历史测试脚本和旧工具。
+## 知识库资料
 
-## 常用命令
-
-清理临时产物：
-
-```powershell
-python tools\maintenance\clean_tmp.py
-```
-
-单独测试百炼智能体应用：
-
-```powershell
-python test_bailian_app.py
-```
-
-查看当前阶段记录：
+知识库相关文件集中在 `knowledge/`：
 
 ```text
-docs/current_status.md
+knowledge/config/   文物候选配置和视觉索引 JSON
+knowledge/refs/     标准参考图片
+knowledge/exhibits/ 每件文物一个 Markdown，上传到百炼知识库
 ```
 
-## 注意
+检查参考图片：
+
+```powershell
+python tools\check_museum_refs.py
+```
+
+根据标准参考图生成/导出文物 Markdown：
+
+```powershell
+python tools\build_exhibit_knowledge.py --overwrite
+```
+
+只根据已有视觉索引重新导出 Markdown：
+
+```powershell
+python tools\build_exhibit_knowledge.py --export-only
+```
+
+## tmp 清理
+
+清理运行时临时产物：
+
+```powershell
+python tools\clean_tmp.py
+```
+
+清理后保留的运行时目录：
+
+```text
+tmp/audio/received/
+tmp/audio/replies/
+tmp/camera/received/
+tmp/camera/preprocess/
+tmp/debug/
+```
+
+不要把需要长期保留的测试文件放到 `tmp/`。
+
+## 注意事项
 
 - 不要提交 `.env` 或真实 API Key。
-- `tmp/` 只存放运行时产物。
-- 需要长期保留的音频/图片样本放到 `samples/`。
+- `tmp/` 可清理，只放运行时产物。
+- `tests/data/` 放测试样本。
+- `knowledge/` 放知识库资料和标准参考图片。
+- 百炼回答里的具体文物名称必须来自知识库标准名称或别名，不能由后端或视觉模型自造名称。

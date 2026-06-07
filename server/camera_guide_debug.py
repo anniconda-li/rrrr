@@ -33,7 +33,7 @@ def build_camera_guide_prompt(user_text: str, vision_result: dict[str, Any]) -> 
     )
 
 
-async def run_camera_guide_debug_test(
+async def run_camera_guide_test(
     *,
     vision_service: VisionService,
     bailian_app_service: BailianAppService,
@@ -47,8 +47,8 @@ async def run_camera_guide_debug_test(
             stage="image_not_found",
             error_type="FileNotFoundError",
             error=(
-                f"默认测试图片不存在：{test_image_path}；请运行 "
-                "python scripts/copy_test_image_to_ref.py，或把图片放到 tmp/camera/test/"
+                f"默认测试图片不存在：{test_image_path}；请把测试图片放到 "
+                "tests/data/camera/test_exhibit.jpg"
             ),
             test_image_path=test_image_path,
             total_start=total_start,

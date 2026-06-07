@@ -14,7 +14,7 @@
     "is_key_exhibit": true,
     "priority": 100,
     "reference_images": [
-      "data/museum_refs/yingguo_yuying/ref_1.jpg"
+      "knowledge/refs/yingguo_yuying/ref_1.jpg"
     ],
     "basic_info": {
       "dynasty": "西周晚期",
@@ -61,7 +61,7 @@
     "is_key_exhibit": true,
     "priority": 90,
     "reference_images": [
-      "data/museum_refs/panlongniu_daigai_tonghe/ref_1.jpg"
+      "knowledge/refs/panlongniu_daigai_tonghe/ref_1.jpg"
     ],
     "basic_info": {
       "dynasty": "西周",
@@ -100,7 +100,7 @@
     "is_key_exhibit": true,
     "priority": 80,
     "reference_images": [
-      "data/museum_refs/denggong_gui/ref_1.jpg"
+      "knowledge/refs/denggong_gui/ref_1.jpg"
     ],
     "basic_info": {
       "dynasty": "西周",
@@ -140,7 +140,7 @@
     "is_key_exhibit": true,
     "priority": 70,
     "reference_images": [
-      "data/museum_refs/lushan_huaci_sanzuxi/ref_1.jpg"
+      "knowledge/refs/lushan_huaci_sanzuxi/ref_1.jpg"
     ],
     "basic_info": {
       "dynasty": "唐代",
@@ -169,46 +169,6 @@
     ]
   },
   {
-    "id": "junyao_tianqingyou_bo",
-    "standard_name": "钧窑天青釉钵",
-    "name": "钧窑天青釉钵",
-    "aliases": [
-      "天青釉钵",
-      "钧瓷钵",
-      "钧窑钵"
-    ],
-    "category": "陶瓷",
-    "is_key_exhibit": true,
-    "priority": 70,
-    "reference_images": [
-      "data/museum_refs/junyao_tianqingyou_bo/ref_1.jpg"
-    ],
-    "basic_info": {
-      "dynasty": "宋代",
-      "usage": "",
-      "material": "陶瓷，钧窑天青釉",
-      "collection": "平顶山市博物馆",
-      "excavation": ""
-    },
-    "visual_features": [
-      "陶瓷器",
-      "天青釉",
-      "钵形",
-      "釉面温润"
-    ],
-    "kb_keywords": [
-      "钧窑天青釉钵",
-      "天青釉钵",
-      "钧瓷",
-      "钧窑"
-    ],
-    "guide_text": "钧窑天青釉钵属于宋代钧窑瓷器，器形为钵，釉色以天青为主要视觉特征。钧窑瓷器以乳浊釉和釉色变化著称，识别时可关注钵形轮廓、釉面质感和天青色调。",
-    "source_urls": [
-      "https://sh.people.com.cn/n2/2021/1116/c134768-35007688.html",
-      "https://www.dpm.org.cn/collection/ceramic/227943.html"
-    ]
-  },
-  {
     "id": "shuyao_chuilinwen_shengding",
     "standard_name": "束腰垂鳞纹升鼎",
     "name": "束腰垂鳞纹升鼎",
@@ -220,7 +180,7 @@
     "is_key_exhibit": true,
     "priority": 70,
     "reference_images": [
-      "data/museum_refs/shuyao_chuilinwen_shengding/ref_1.jpg"
+      "knowledge/refs/shuyao_chuilinwen_shengding/ref_1.jpg"
     ],
     "basic_info": {
       "dynasty": "春秋",

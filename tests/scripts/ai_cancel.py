@@ -32,7 +32,7 @@ class AiCancelTest(unittest.TestCase):
         os.environ["TTS_PROVIDER"] = "mock"
         os.environ["ASR_PROVIDER"] = "mock"
         os.environ["AUTO_TTS_BACKGROUND"] = "false"
-        root = Path("tmp/test_ai_cancel")
+        root = Path("tmp/debug/test_ai_cancel")
         self.app = create_http_app(root / "wav", root / "jpg", 1, False)
         self.client = TestClient(self.app)
         self.wav = make_wav()

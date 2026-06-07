@@ -11,7 +11,7 @@ from services.tts_service import synthesize_wav_16k
 FIXED_ANSWER = "你好，我是景区导游助手。当前语音回复链路已经打通。"
 
 
-class TourOrchestrator:
+class VoiceQaService:
     def __init__(self, bailian_app_service: BailianAppService | None = None):
         self.bailian_app_service = bailian_app_service
 
@@ -50,7 +50,7 @@ class TourOrchestrator:
     ) -> tuple[str, str]:
         wav_path = Path(wav_path)
         print(
-            f"[TourOrchestrator] process wav={wav_path} device={device} "
+            f"[VoiceQaService] process wav={wav_path} device={device} "
             f"spot_id={spot_id} mode={mode} llm_provider=bailian_app",
             flush=True,
         )
