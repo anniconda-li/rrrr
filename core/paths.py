@@ -7,13 +7,12 @@
 - 运行时目录
 - 向后兼容的旧版路径别名
 
-同时提供目录自动创建和默认测试图片初始化功能。
+同时提供目录自动创建和默认测试图片检查功能。
 """
 
 from __future__ import annotations
 
 import os
-import shutil
 from pathlib import Path
 
 from core.config import PROJECT_ROOT
@@ -86,10 +85,6 @@ LEGACY_REPLY_WAV_DIR = TMP_DIR / "reply_wav"
 LEGACY_DEBUG_REPLY_WAV_DIR = TMP_DIR / "debug_reply_wav"
 LEGACY_TEST_AI_CANCEL_DIR = TMP_DIR / "test_ai_cancel"
 LEGACY_TEST_JPG_DIR = TMP_DIR / "test_jpg"
-# 旧版测试图片路径
-LEGACY_CAMERA_TEST_IMAGE = LEGACY_RECEIVED_JPG_DIR / "camera_upload_20260603_165431_081287.jpg"
-LEGACY_NORMALIZED_CAMERA_TEST_IMAGE = TMP_CAMERA_DIR / "test" / "camera_upload_20260603_165431_081287.jpg"
-LEGACY_NAMED_TEST_IMAGE = TMP_CAMERA_DIR / "test" / "test_exhibit.jpg"
 
 # =============================================================================
 # 默认测试图片路径
@@ -180,38 +175,22 @@ def ensure_runtime_dirs() -> None:
 def ensure_default_camera_test_image() -> dict[str, object]:
     """确保默认相机测试图片可用。
 
-    优先尝试从旧版路径复制测试图片到新位置。
-    如果目标已存在则跳过复制。
+    默认测试图片应放在 tests/data/camera/ 下。这里不再从 tmp 里的历史
+    运行时图片自动复制，避免生产部署时依赖某个本地调试文件。
 
     Returns:
-        dict: 包含源路径、目标路径和是否已复制标志的信息字典
+        dict: 包含目标路径和是否存在的信息字典
     """
     target = DEFAULT_CAMERA_TEST_IMAGE
-    # 按优先级尝试的源图片候选路径
-    source_candidates = (
-        LEGACY_NAMED_TEST_IMAGE,
-        LEGACY_NORMALIZED_CAMERA_TEST_IMAGE,
-        LEGACY_CAMERA_TEST_IMAGE,
-    )
-    copied = False
     target.parent.mkdir(parents=True, exist_ok=True)
-    source = next((path for path in source_candidates if path.exists()), source_candidates[-1])
-    if not target.exists():
-        existing_source = next((path for path in source_candidates if path.exists()), None)
-        if existing_source is not None:
-            shutil.copy2(existing_source, target)
-            source = existing_source
-            copied = True
     info = {
-        "source_test_image": str(source),
         "target_test_image": str(target),
-        "copied_from_legacy": copied,
+        "exists": target.exists(),
     }
     print(
         "[PATHS] "
-        f"source_test_image={info['source_test_image']} "
         f"target_test_image={info['target_test_image']} "
-        f"copied_from_legacy={str(copied).lower()}",
+        f"exists={str(info['exists']).lower()}",
         flush=True,
     )
     return info

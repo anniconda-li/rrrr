@@ -36,7 +36,7 @@ def main() -> int:
     parser.add_argument(
         "--image",
         default=str(DEFAULT_CAMERA_TEST_IMAGE),
-        help="测试图片路径，默认使用 DEFAULT_CAMERA_TEST_IMAGE",
+        help="测试图片路径，默认使用 tests/data/camera/test_exhibit.jpg",
     )
     parser.add_argument(
         "--text",
