@@ -115,6 +115,131 @@ ENABLE_DEBUG_ROUTES=true
 
 开启后才会注册 `/debug/camera_guide/test`。
 
+## Ubuntu systemd 部署
+
+以下示例假设代码部署到 `/opt/wkt1_backend`，服务运行用户为 `ubuntu`。如果你的服务器用户名不同，把示例里的 `ubuntu` 改成实际用户。
+
+安装系统依赖：
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip ffmpeg
+```
+
+部署代码并创建虚拟环境：
+
+```bash
+sudo mkdir -p /opt/wkt1_backend
+sudo chown -R "$USER:$USER" /opt/wkt1_backend
+cd /opt
+git clone <你的仓库地址> wkt1_backend
+cd /opt/wkt1_backend
+python3 -m venv .venv
+. .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+创建并填写环境变量：
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+至少确认这些配置：
+
+```text
+DASHSCOPE_API_KEY=你的 DashScope Key
+BAILIAN_API_KEY=你的百炼 Key
+BAILIAN_APP_ID=你的百炼应用 ID
+AUTO_TTS_BACKGROUND=true
+ENABLE_DEBUG_ROUTES=false
+FFMPEG_BIN=ffmpeg
+```
+
+先手动启动验证：
+
+```bash
+cd /opt/wkt1_backend
+. .venv/bin/activate
+python -m server.walkie_app --host 0.0.0.0 --http-port 8000 --udp-port 9000
+```
+
+另开终端检查：
+
+```bash
+curl http://127.0.0.1:8000/healthz
+curl http://127.0.0.1:8000/readyz
+```
+
+创建 systemd 服务：
+
+```bash
+sudo nano /etc/systemd/system/wkt1-backend.service
+```
+
+写入：
+
+```ini
+[Unit]
+Description=WTK1 AI Guide Backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/wkt1_backend
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/wkt1_backend/.venv/bin/python -m server.walkie_app --host 0.0.0.0 --http-port 8000 --udp-port 9000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+启动并设置开机自启：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable wkt1-backend
+sudo systemctl start wkt1-backend
+sudo systemctl status wkt1-backend
+```
+
+查看日志：
+
+```bash
+journalctl -u wkt1-backend -f
+```
+
+如果启用了 UFW 防火墙，放开 HTTP 和 UDP 端口：
+
+```bash
+sudo ufw allow 8000/tcp
+sudo ufw allow 9000/udp
+sudo ufw status
+```
+
+更新代码后重启：
+
+```bash
+cd /opt/wkt1_backend
+git pull
+. .venv/bin/activate
+pip install -r requirements.txt
+sudo systemctl restart wkt1-backend
+```
+
+如果只部署 HTTP API，不需要 UDP 实时对讲，可以把 systemd 里的 `ExecStart` 改为：
+
+```ini
+ExecStart=/opt/wkt1_backend/.venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
 ## 实时对讲
 
 后端保留 UDP WTK1 数据包接收和同设备音频回传能力，用于实时音频对讲测试。
