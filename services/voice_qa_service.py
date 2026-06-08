@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 
@@ -131,6 +132,49 @@ class VoiceQaService:
 
         return asr_text, answer_text
 
+    async def process_text_session_async(
+        self,
+        wav_path: str | Path,
+        device: str = "walkie-01",
+        spot_id: str = "dayanta",
+        image_context: str = "",
+        mode: str = "fixed",
+    ) -> tuple[str, str]:
+        """异步处理文本链路。
+
+        ASR SDK 是阻塞调用，仍放在线程池；百炼 HTTP 调用走真正的异步
+        ``ask_async``，避免 FastAPI 事件循环里再嵌套 ``asyncio.run``。
+        """
+        wav_path = Path(wav_path)
+        print(
+            f"[VoiceQaService] process_async wav={wav_path} device={device} "
+            f"spot_id={spot_id} mode={mode} llm_provider=bailian_app",
+            flush=True,
+        )
+
+        if mode == "fixed":
+            return "", FIXED_ANSWER
+        if mode != "asr_bailian_app":
+            raise ValueError(f"不支持的 TOUR_MODE: {mode}")
+
+        asr_start = time.perf_counter()
+        try:
+            asr_text = await asyncio.to_thread(transcribe_wav, wav_path)
+        except Exception as exc:
+            print(f"[AI-TIME] asr={time.perf_counter() - asr_start:.3f}s error={exc}", flush=True)
+            raise RuntimeError(f"ASR 失败: {exc}") from exc
+        print(f"[AI] asr_text: {asr_text}", flush=True)
+        print(f"[AI-TIME] asr={time.perf_counter() - asr_start:.3f}s text_chars={len(asr_text)}", flush=True)
+
+        answer_text = await self._ask_llm_async(
+            asr_text,
+            device=device,
+            spot_id=spot_id,
+            image_context=image_context,
+        )
+        print(f"[AI] answer_text chars: {len(answer_text)}", flush=True)
+        return asr_text, answer_text
+
     def _ask_llm(
         self,
         question: str,
@@ -158,6 +202,34 @@ class VoiceQaService:
         bailian_start = time.perf_counter()
         try:
             answer_text = self.bailian_app_service.ask(question)
+        except Exception as exc:
+            print(f"[AI-TIME] bailian_app={time.perf_counter() - bailian_start:.3f}s error={exc}", flush=True)
+            raise RuntimeError(f"百炼应用调用失败: {exc}") from exc
+        print(
+            f"[AI-TIME] bailian_app={time.perf_counter() - bailian_start:.3f}s "
+            f"answer_chars={len(answer_text)}",
+            flush=True,
+        )
+        return answer_text
+
+    async def _ask_llm_async(
+        self,
+        question: str,
+        *,
+        device: str,
+        spot_id: str,
+        image_context: str,
+    ) -> str:
+        """异步调用百炼 LLM。
+
+        ``device``、``spot_id``、``image_context`` 保留在签名中，便于后续把
+        设备上下文和图片上下文纳入 prompt；当前百炼应用只接收问题文本。
+        """
+        if self.bailian_app_service is None:
+            raise RuntimeError("百炼应用服务未配置")
+        bailian_start = time.perf_counter()
+        try:
+            answer_text = await self.bailian_app_service.ask_async(question)
         except Exception as exc:
             print(f"[AI-TIME] bailian_app={time.perf_counter() - bailian_start:.3f}s error={exc}", flush=True)
             raise RuntimeError(f"百炼应用调用失败: {exc}") from exc

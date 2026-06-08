@@ -158,6 +158,61 @@ class PhotoGuideService:
             gate_reason="降级 本地类别讲解",
         )
 
+    async def build_answer_async(
+        self,
+        observation: VisionObservation,
+        *,
+        device: str,
+        image_id: str,
+    ) -> PhotoGuideResult:
+        """异步构建导游回答。
+
+        FastAPI 路由使用这个入口，让百炼 HTTP 请求保持异步；同步
+        ``build_answer`` 保留给命令行脚本和纯同步测试。
+        """
+        mode, gate_reason = choose_mode_with_reason(observation)
+        print(f"[CAMERA] 选中模式 mode={mode} gate_reason={gate_reason}", flush=True)
+
+        if mode == RETAKE_MODE:
+            return PhotoGuideResult(mode=mode, grounded=False, answer_text=RETAKE_ANSWER, gate_reason=gate_reason)
+
+        if mode in {SPECIFIC_MODE, POSSIBLE_MODE}:
+            candidate_answer = await self._ask_candidate_async(
+                observation,
+                mode=mode,
+                device=device,
+                image_id=image_id,
+            )
+            if _has_grounded_answer(candidate_answer):
+                return PhotoGuideResult(
+                    mode=mode,
+                    grounded=True,
+                    answer_text=_clean_answer(candidate_answer),
+                    gate_reason=gate_reason,
+                )
+            if self.bailian_app_service is None:
+                return PhotoGuideResult(
+                    mode=mode,
+                    grounded=False,
+                    answer_text=_local_candidate_answer(observation, mode),
+                    gate_reason="降级 本地候选讲解",
+                )
+
+        category_answer = await self._ask_category_async(observation, device=device, image_id=image_id)
+        if _has_grounded_answer(category_answer):
+            return PhotoGuideResult(
+                mode=CATEGORY_MODE,
+                grounded=True,
+                answer_text=_clean_answer(category_answer),
+                gate_reason="候选回答不可用，降级到类别引导",
+            )
+        return PhotoGuideResult(
+            mode=CATEGORY_MODE,
+            grounded=False,
+            answer_text=LOCAL_CATEGORY_GUIDES.get(observation.category, RETAKE_ANSWER),
+            gate_reason="降级 本地类别讲解",
+        )
+
     def _ask_candidate(self, observation: VisionObservation, *, mode: str, device: str, image_id: str) -> str:
         """调用 LLM 进行具体/可能展品讲解。
 
@@ -176,6 +231,27 @@ class PhotoGuideService:
         """
         if self.bailian_app_service is None:
             return ""
+        return self.bailian_app_service.ask(
+            self._candidate_prompt(observation, mode=mode, device=device, image_id=image_id)
+        )
+
+    async def _ask_candidate_async(
+        self,
+        observation: VisionObservation,
+        *,
+        mode: str,
+        device: str,
+        image_id: str,
+    ) -> str:
+        """异步调用 LLM 进行具体/可能展品讲解。"""
+        if self.bailian_app_service is None:
+            return ""
+        return await self.bailian_app_service.ask_async(
+            self._candidate_prompt(observation, mode=mode, device=device, image_id=image_id)
+        )
+
+    def _candidate_prompt(self, observation: VisionObservation, *, mode: str, device: str, image_id: str) -> str:
+        """构建具体/可能展品讲解 prompt。"""
         candidate = self.candidates_by_id.get(observation.best_candidate_id)
         keywords = "、".join(candidate.kb_keywords if candidate else [observation.best_candidate_name])
         caution = (
@@ -196,7 +272,7 @@ class PhotoGuideService:
             "如果知识库没有相关内容，请只回复：知识库无相关内容。"
             "回答适合语音播报，50到120字，不要Markdown，不要项目符号。"
         )
-        return self.bailian_app_service.ask(prompt)
+        return prompt
 
     def _ask_category(self, observation: VisionObservation, *, device: str, image_id: str) -> str:
         """调用 LLM 进行类别引导讲解。
@@ -213,15 +289,26 @@ class PhotoGuideService:
         """
         if self.bailian_app_service is None:
             return ""
+        return self.bailian_app_service.ask(self._category_prompt(observation, device=device, image_id=image_id))
+
+    async def _ask_category_async(self, observation: VisionObservation, *, device: str, image_id: str) -> str:
+        """异步调用 LLM 进行类别引导讲解。"""
+        if self.bailian_app_service is None:
+            return ""
+        return await self.bailian_app_service.ask_async(
+            self._category_prompt(observation, device=device, image_id=image_id)
+        )
+
+    def _category_prompt(self, observation: VisionObservation, *, device: str, image_id: str) -> str:
+        """构建类别引导 prompt。"""
         themes = CATEGORY_THEMES.get(observation.category, "平顶山博物馆展览主题")
-        prompt = (
+        return (
             "游客拍到的具体文物名称不能可靠确认，不能编造具体文物名称。"
             f'请围绕"{observation.category}"这类展品讲怎么看，并尽量结合知识库相关主题：{themes}。'
             f"照片可见特征：{'、'.join(observation.visible_features) or '无'}。"
             f"不确定风险：{observation.risk or '无'}。"
             "回答适合语音播报，50到120字，不要Markdown，不要项目符号，不要说识别失败。"
         )
-        return self.bailian_app_service.ask(prompt)
 
 
 def choose_mode(observation: VisionObservation) -> str:

@@ -30,9 +30,7 @@ import argparse
 import asyncio
 import json
 import logging
-import math
 import os
-import struct
 import socket
 import threading
 import time
@@ -56,19 +54,17 @@ from core.paths import (
 )
 from services.bailian_app_service import BailianAppService
 from server.camera_guide_debug import run_camera_guide_test
+from server.media import (
+    parse_wav,
+    validate_and_log_jpeg,
+    validate_and_log_wav,
+)
+from server.protocol import PKT_TYPES, make_server_echo, parse_packet
 from services.photo_guide_service import PhotoGuideService, RETAKE_MODE, choose_mode, response_payload
 from services.asr_service import transcribe_wav
 from services.voice_qa_service import FIXED_ANSWER, VoiceQaService
 from services.tts_service import ERROR_TEXT, synthesize_wav_16k
 from services.vision_service import VisionObservation, VisionService
-
-# =============================================================================
-# WTK1 UDP 协议常量
-# =============================================================================
-MAGIC = b"WTK1"          # 协议魔术字
-HEADER_LEN = 34          # 包头长度（字节）
-DEVICE_LEN = 16          # 设备名字段长度（字节）
-SERVER_DEVICE = b"server-echo"  # 服务端回传时使用的设备名
 
 # =============================================================================
 # 用户可配置的默认值
@@ -90,50 +86,10 @@ DEFAULT_AI_REPLY_EXTRA_CHUNK = False
 
 logger = logging.getLogger(__name__)
 
-# WTK1 包类型映射
-PKT_TYPES = {
-    1: "register",
-    2: "channel",
-    3: "ptt_start",
-    4: "audio",
-    5: "ptt_stop",
-    6: "heartbeat",
-}
-
 
 # =============================================================================
 # 数据结构定义
 # =============================================================================
-
-@dataclass
-class Packet:
-    """WTK1 协议包。"""
-    packet_type: int      # 包类型
-    channel: int          # 频道号
-    seq: int              # 序列号
-    timestamp_ms: int     # 时间戳（毫秒）
-    device: str           # 设备名
-    payload: bytes        # 负载数据
-
-
-@dataclass
-class WavInfo:
-    """WAV 音频文件信息。"""
-    audio_format: int     # 音频格式（1=PCM）
-    channels: int         # 声道数
-    sample_rate: int      # 采样率（Hz）
-    bits_per_sample: int  # 位深
-    data_offset: int      # 音频数据起始偏移
-    data_size: int        # 音频数据大小（字节）
-
-
-@dataclass
-class JpegInfo:
-    """JPEG 图片文件信息。"""
-    width: int | None = None       # 图片宽度（像素）
-    height: int | None = None      # 图片高度（像素）
-    progressive: bool = False      # 是否渐进式 JPEG
-
 
 @dataclass
 class AiSession:
@@ -182,383 +138,6 @@ def auto_tts_background_enabled() -> bool:
     """
     value = os.getenv("AUTO_TTS_BACKGROUND", "true").strip().lower()
     return value in {"1", "true", "yes", "on"}
-
-
-# =============================================================================
-# 二进制数据解析函数
-# =============================================================================
-
-def read_u16(data: bytes, offset: int) -> int:
-    """从字节数组中读取小端 16 位无符号整数。"""
-    return data[offset] | (data[offset + 1] << 8)
-
-
-def read_u32(data: bytes, offset: int) -> int:
-    """从字节数组中读取小端 32 位无符号整数。"""
-    return (
-        data[offset]
-        | (data[offset + 1] << 8)
-        | (data[offset + 2] << 16)
-        | (data[offset + 3] << 24)
-    )
-
-
-def parse_packet(data: bytes) -> Packet | None:
-    """解析 WTK1 协议包。
-
-    Returns:
-        Packet | None: 解析成功返回 Packet 对象，否则返回 None
-    """
-    if len(data) < HEADER_LEN or data[:4] != MAGIC:
-        return None
-
-    header_len = data[5]
-    payload_len = read_u16(data, 32)
-    if header_len != HEADER_LEN or len(data) < header_len + payload_len:
-        return None
-
-    # 提取设备名（以 \x00 结尾的字符串）
-    device_raw = data[16:32].split(b"\x00", 1)[0]
-    return Packet(
-        packet_type=data[4],
-        channel=read_u16(data, 6),
-        seq=read_u32(data, 8),
-        timestamp_ms=read_u32(data, 12),
-        device=device_raw.decode("utf-8", errors="replace"),
-        payload=data[header_len : header_len + payload_len],
-    )
-
-
-def make_server_echo(data: bytes) -> bytes:
-    """构造服务端回传包：将原始包的设备名替换为服务端标识。"""
-    out = bytearray(data)
-    out[16:32] = b"\x00" * DEVICE_LEN
-    out[16 : 16 + len(SERVER_DEVICE)] = SERVER_DEVICE
-    return bytes(out)
-
-
-# =============================================================================
-# WAV 音频处理
-# =============================================================================
-
-def parse_wav(body: bytes) -> WavInfo | None:
-    """解析 WAV 文件的 RIFF 头，提取音频参数。
-
-    支持标准 PCM WAV 格式，能跳过 fmt 和数据块之间的非标准块。
-
-    Returns:
-        WavInfo | None: 解析成功返回 WavInfo，否则返回 None
-    """
-    if len(body) < 44 or body[:4] != b"RIFF" or body[8:12] != b"WAVE":
-        return None
-
-    pos = 12
-    audio_format = channels = sample_rate = bits_per_sample = None
-    data_offset = data_size = None
-
-    # 遍历 RIFF 块查找 fmt 和 data 块
-    while pos + 8 <= len(body):
-        chunk_id = body[pos : pos + 4]
-        chunk_size = read_u32(body, pos + 4)
-        chunk_data = pos + 8
-        chunk_end = chunk_data + chunk_size
-        if chunk_end > len(body):
-            return None
-
-        if chunk_id == b"fmt ":
-            if chunk_size < 16:
-                return None
-            audio_format, channels, sample_rate, _byte_rate, _block_align, bits_per_sample = struct.unpack_from(
-                "<HHIIHH", body, chunk_data
-            )
-        elif chunk_id == b"data":
-            data_offset = chunk_data
-            data_size = chunk_size
-            break
-
-        pos = chunk_end + (chunk_size & 1)  # 对齐到偶数边界
-
-    if (
-        audio_format is None
-        or channels is None
-        or sample_rate is None
-        or bits_per_sample is None
-        or data_offset is None
-        or data_size is None
-    ):
-        return None
-
-    return WavInfo(
-        audio_format=audio_format,
-        channels=channels,
-        sample_rate=sample_rate,
-        bits_per_sample=bits_per_sample,
-        data_offset=data_offset,
-        data_size=data_size,
-    )
-
-
-def pcm16_stats(pcm: bytes) -> str:
-    """计算 16-bit PCM 音频数据的统计信息。
-
-    包括采样数、最小/最大值、均值、RMS、峰值、削波数和过零率。
-    用于日志记录和音频质量诊断。
-    """
-    sample_count = len(pcm) // 2
-    if sample_count == 0:
-        return "samples=0"
-
-    samples = struct.unpack_from(f"<{sample_count}h", pcm[: sample_count * 2])
-    min_v = min(samples)
-    max_v = max(samples)
-    mean = sum(samples) / sample_count
-    rms = math.sqrt(sum(s * s for s in samples) / sample_count)
-    peak = max(abs(min_v), abs(max_v))
-    # 统计削波样本数（接近 16-bit 极限值）
-    clipped = sum(1 for s in samples if s <= -32760 or s >= 32760)
-    # 计算过零率（反映频率特性）
-    zero_cross = sum(
-        1
-        for prev, cur in zip(samples, samples[1:])
-        if (prev < 0 <= cur) or (prev > 0 >= cur)
-    )
-    zcr = zero_cross / max(sample_count - 1, 1)
-
-    return (
-        f"samples={sample_count} min={min_v} max={max_v} "
-        f"mean={mean:.1f} rms={rms:.1f} peak={peak} "
-        f"clipped={clipped} zcr={zcr:.3f}"
-    )
-
-
-def save_wav(body: bytes, save_dir: Path) -> Path:
-    """保存 WAV 文件到指定目录，文件名带时间戳。
-
-    Returns:
-        Path: 保存的文件路径
-    """
-    save_dir.mkdir(parents=True, exist_ok=True)
-    path = save_dir / f"ai_upload_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.wav"
-    path.write_bytes(body)
-    return path
-
-
-def validate_and_log_wav(body: bytes, save_dir: Path, prefix: str) -> tuple[bool, Path | None]:
-    """验证 WAV 格式并记录详细日志。
-
-    Returns:
-        tuple[bool, Path | None]: (是否有效, 保存路径)
-    """
-    wav = parse_wav(body)
-    if wav is None:
-        log(f"{prefix} 无效 WAV len={len(body)}")
-        return False, None
-
-    pcm = body[wav.data_offset : wav.data_offset + wav.data_size]
-    duration = 0.0
-    if wav.sample_rate > 0 and wav.channels > 0 and wav.bits_per_sample > 0:
-        bytes_per_sample = wav.channels * wav.bits_per_sample // 8
-        if bytes_per_sample > 0:
-            duration = wav.data_size / bytes_per_sample / wav.sample_rate
-
-    save_path = save_wav(body, save_dir)
-    stats = pcm16_stats(pcm) if wav.audio_format == 1 and wav.bits_per_sample == 16 else "pcm_stats=unsupported"
-    log(
-        f"{prefix} WAV fmt={wav.audio_format} ch={wav.channels} rate={wav.sample_rate} "
-        f"bits={wav.bits_per_sample} data={wav.data_size} duration={duration:.2f}s "
-        f"{stats} saved={save_path}"
-    )
-    return True, save_path
-
-
-def build_pcm_wav(
-    pcm: bytes,
-    *,
-    sample_rate: int,
-    channels: int,
-    bits_per_sample: int,
-    add_extra_chunk: bool,
-) -> bytes:
-    """将原始 PCM 数据封装为标准 WAV 文件。
-
-    Args:
-        pcm: 原始 PCM 音频数据
-        sample_rate: 采样率（Hz）
-        channels: 声道数
-        bits_per_sample: 位深
-        add_extra_chunk: 是否在 fmt 和 data 之间插入 JUNK 块
-                         用于测试设备是否假定固定的 44 字节 WAV 头
-
-    Returns:
-        bytes: 完整的 WAV 文件数据
-    """
-    if bits_per_sample % 8 != 0:
-        raise ValueError("bits_per_sample 必须是 8 的倍数")
-
-    block_align = channels * bits_per_sample // 8
-    byte_rate = sample_rate * block_align
-    # 构建 fmt 块
-    fmt_chunk = struct.pack(
-        "<4sIHHIIHH",
-        b"fmt ",
-        16,
-        1,              # PCM 格式
-        channels,
-        sample_rate,
-        byte_rate,
-        block_align,
-        bits_per_sample,
-    )
-    chunks = [fmt_chunk]
-
-    if add_extra_chunk:
-        # 插入 JUNK 块，强制设备从非标准偏移查找数据块
-        junk_payload = b"stream-test-extra"
-        chunks.append(struct.pack("<4sI", b"JUNK", len(junk_payload)) + junk_payload)
-        if len(junk_payload) & 1:
-            chunks.append(b"\x00")  # RIFF 块对齐
-
-    # 构建 data 块
-    chunks.append(struct.pack("<4sI", b"data", len(pcm)) + pcm)
-    body = b"".join(chunks)
-    return b"RIFF" + struct.pack("<I", 4 + len(body)) + b"WAVE" + body
-
-
-def make_ai_reply_wav(upload_wav: bytes, repeat: int, add_extra_chunk: bool) -> bytes | None:
-    """根据上传的 WAV 生成 AI 测试回复 WAV。
-
-    提取上传 WAV 的 PCM 数据，可选重复多次后重新封装。
-    用于设备端的声学回环测试。
-
-    Args:
-        upload_wav: 上传的 WAV 数据
-        repeat: PCM 数据重复次数
-        add_extra_chunk: 是否添加 JUNK 块
-
-    Returns:
-        bytes | None: 回复 WAV 数据，格式不兼容时返回 None
-    """
-    wav = parse_wav(upload_wav)
-    if wav is None:
-        return None
-    if wav.audio_format != 1:  # 仅支持 PCM
-        return None
-    pcm = upload_wav[wav.data_offset : wav.data_offset + wav.data_size]
-    if repeat > 1:
-        pcm = pcm * repeat
-    return build_pcm_wav(
-        pcm,
-        sample_rate=wav.sample_rate,
-        channels=wav.channels,
-        bits_per_sample=wav.bits_per_sample,
-        add_extra_chunk=add_extra_chunk,
-    )
-
-
-# =============================================================================
-# JPEG 图片处理
-# =============================================================================
-
-def parse_jpeg(body: bytes) -> JpegInfo | None:
-    """解析 JPEG 文件，提取尺寸和编码类型。
-
-    遍历 JPEG 标记段，从 SOF0/SOF1/SOF2 标记中读取宽高。
-
-    Returns:
-        JpegInfo | None: 解析成功返回 JpegInfo，否则返回 None
-    """
-    # 检查 JPEG SOI 和 EOI 标记
-    if len(body) < 4 or body[:2] != b"\xFF\xD8" or body[-2:] != b"\xFF\xD9":
-        return None
-
-    pos = 2
-    while pos + 4 <= len(body):
-        if body[pos] != 0xFF:
-            pos += 1
-            continue
-        # 跳过填充字节
-        while pos < len(body) and body[pos] == 0xFF:
-            pos += 1
-        if pos >= len(body):
-            break
-
-        marker = body[pos]
-        pos += 1
-        # 跳过独立标记和 RST 标记
-        if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
-            continue
-        if pos + 2 > len(body):
-            return None
-
-        segment_len = read_u16_be(body, pos)
-        if segment_len < 2 or pos + segment_len > len(body):
-            return None
-
-        # SOF0（基线）、SOF1（扩展）、SOF2（渐进）
-        if marker in (0xC0, 0xC1, 0xC2):
-            if segment_len < 7:
-                return None
-            height = read_u16_be(body, pos + 3)
-            width = read_u16_be(body, pos + 5)
-            return JpegInfo(width=width, height=height, progressive=(marker == 0xC2))
-
-        pos += segment_len
-
-    return JpegInfo()
-
-
-def read_u16_be(data: bytes, offset: int) -> int:
-    """从字节数组中读取大端 16 位无符号整数。"""
-    return (data[offset] << 8) | data[offset + 1]
-
-
-def save_jpeg(body: bytes, save_dir: Path) -> Path:
-    """保存 JPEG 文件到指定目录，文件名带时间戳。
-
-    Returns:
-        Path: 保存的文件路径
-    """
-    save_dir.mkdir(parents=True, exist_ok=True)
-    path = save_dir / f"camera_upload_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
-    path.write_bytes(body)
-    return path
-
-
-def save_camera_raw(body: bytes, save_dir: Path) -> Path:
-    """保存无效的 JPEG 原始数据（用于调试）。
-
-    Returns:
-        Path: 保存的文件路径
-    """
-    save_dir.mkdir(parents=True, exist_ok=True)
-    path = save_dir / f"camera_upload_invalid_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.bin"
-    path.write_bytes(body)
-    return path
-
-
-def validate_and_log_jpeg(body: bytes, save_dir: Path, prefix: str) -> tuple[bool, Path | None, JpegInfo | None]:
-    """验证 JPEG 格式并记录详细日志。
-
-    Returns:
-        tuple: (是否有效, 保存路径, JPEG 信息)
-    """
-    jpeg = parse_jpeg(body)
-    if jpeg is None:
-        save_path = save_camera_raw(body, save_dir)
-        log(
-            f"{prefix} 无效 JPEG len={len(body)} "
-            f"soi={body[:2].hex()} eoi={body[-2:].hex() if len(body) >= 2 else ''} "
-            f"saved_raw={save_path}"
-        )
-        return False, save_path, None
-
-    save_path = save_jpeg(body, save_dir)
-    size_text = f"{jpeg.width}x{jpeg.height}" if jpeg.width and jpeg.height else "unknown"
-    log(
-        f"{prefix} JPEG len={len(body)} size={size_text} "
-        f"progressive={int(jpeg.progressive)} saved={save_path}"
-    )
-    return True, save_path, jpeg
 
 
 # =============================================================================
@@ -937,10 +516,9 @@ def create_http_app(
                 log(f"LLM 跳过 因会话已取消 session={ai_session.session_id}")
                 return "", ""
 
-        # 第 2 步：LLM 问答
+        # 第 2 步：LLM 问答。百炼 HTTP 调用保持异步，避免占用线程池。
         try:
-            answer_text = await asyncio.to_thread(
-                app.state.voice_qa_service._ask_llm,
+            answer_text = await app.state.voice_qa_service._ask_llm_async(
                 asr_text,
                 device=ai_session.device,
                 spot_id=spot_id,
@@ -1075,8 +653,7 @@ def create_http_app(
         if not isinstance(observation, VisionObservation):
             return "这张照片信息不太够。请把展品放在画面中间，靠近一点，避开展柜反光后重拍。"
 
-        guide = await asyncio.to_thread(
-            app.state.photo_guide_service.build_answer,
+        guide = await app.state.photo_guide_service.build_answer_async(
             observation,
             device=safe_device,
             image_id=image_id,
@@ -1535,8 +1112,7 @@ def create_http_app(
 
         # 生成导游讲解
         guide_start = time.perf_counter()
-        guide = await asyncio.to_thread(
-            app.state.photo_guide_service.build_answer,
+        guide = await app.state.photo_guide_service.build_answer_async(
             observation,
             device=safe_device,
             image_id=image_id,

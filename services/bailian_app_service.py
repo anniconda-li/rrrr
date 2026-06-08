@@ -63,7 +63,10 @@ class BailianAppService:
         self.timeout = _read_timeout(timeout)
 
     def ask(self, prompt: str) -> str:
-        """同步调用百炼应用（内部使用 asyncio.run）。
+        """同步调用百炼应用。
+
+        Web 路由应优先使用 ``ask_async``。这个同步包装只保留给命令行脚本
+        或纯同步服务调用，避免在已有事件循环中嵌套 ``asyncio.run``。
 
         Args:
             prompt: 用户提示词
@@ -71,6 +74,12 @@ class BailianAppService:
         Returns:
             str: AI 回复文本
         """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError("BailianAppService.ask() 不能在事件循环中调用，请改用 ask_async()")
         return asyncio.run(self.ask_async(prompt))
 
     async def ask_async(self, prompt: str) -> str:
