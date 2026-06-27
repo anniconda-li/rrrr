@@ -220,16 +220,20 @@ class VoiceQaService:
         spot_id: str,
         image_context: str,
     ) -> str:
-        """异步调用百炼 LLM。
+        """异步调用百炼 LLM（通用问答应用）。
 
-        ``device``、``spot_id``、``image_context`` 保留在签名中，便于后续把
-        设备上下文和图片上下文纳入 prompt；当前百炼应用只接收问题文本。
+        当 image_context 非空时，将图片上下文拼入 prompt，
+        让百炼通用问答应用结合视觉识别结果进行回答。
         """
         if self.bailian_app_service is None:
             raise RuntimeError("百炼应用服务未配置")
         bailian_start = time.perf_counter()
         try:
-            answer_text = await self.bailian_app_service.ask_async(question)
+            if image_context:
+                prompt = f"{image_context}\n\n用户问：{question}"
+            else:
+                prompt = question
+            answer_text = await self.bailian_app_service.ask_async(prompt)
         except Exception as exc:
             print(f"[AI-TIME] bailian_app={time.perf_counter() - bailian_start:.3f}s error={exc}", flush=True)
             raise RuntimeError(f"百炼应用调用失败: {exc}") from exc

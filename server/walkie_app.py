@@ -64,11 +64,12 @@ from services.ai_session_store import (
     is_session_canceled,
     mark_session_canceled,
 )
-from services.photo_guide_service import PhotoGuideService, RETAKE_MODE, choose_mode, response_payload
+from services.artifact_search_service import ArtifactMatchResult, ArtifactSearchService
+from services.photo_guide_service import PhotoGuideResult, PhotoGuideService, RETAKE_MODE, response_payload
 from services.asr_service import transcribe_wav
 from services.voice_qa_service import FIXED_ANSWER, VoiceQaService
 from services.tts_service import ERROR_TEXT, synthesize_wav_16k
-from services.vision_service import VisionObservation, VisionService
+from services.vision_service import VisualDescription, VisionService
 
 # =============================================================================
 # 用户可配置的默认值
@@ -156,11 +157,21 @@ def create_http_app(
     app.state.latest_reply_dir = env_path("LATEST_TMP_DIR", app.state.reply_save_dir)
 
     # 初始化各服务实例
-    bailian_app_service = BailianAppService()
-    app.state.bailian_app_service = bailian_app_service
-    app.state.voice_qa_service = VoiceQaService(bailian_app_service)
+    # 两个独立的百炼应用：
+    # - bailian_vision: 挂视觉指纹知识库，用于语义检索匹配文物
+    # - bailian_qa: 不挂知识库，用于通用导游问答
+    bailian_vision = BailianAppService(app_id=os.getenv("BAILIAN_VISION_APP_ID", ""))
+    bailian_qa = BailianAppService(app_id=os.getenv("BAILIAN_QA_APP_ID", ""))
+
+    app.state.bailian_app_service = bailian_qa  # 向后兼容，默认指向问答应用
+    app.state.bailian_vision_service = bailian_vision
+    app.state.bailian_qa_service = bailian_qa
     app.state.vision_service = VisionService()
-    app.state.photo_guide_service = PhotoGuideService(bailian_app_service)
+    app.state.artifact_search = ArtifactSearchService(bailian_vision)
+    app.state.photo_guide_service = PhotoGuideService(bailian_qa)
+    app.state.voice_qa_service = VoiceQaService(bailian_qa)
+    # 缓存最新视觉描述（替代旧版 latest_image_analysis）
+    app.state.latest_visual_descriptions: dict[str, dict] = {}
 
     @app.get("/healthz")
     async def healthz() -> dict[str, object]:
@@ -172,7 +183,8 @@ def create_http_app(
         """Readiness probe with lightweight dependency configuration checks."""
         return {
             "ok": True,
-            "bailian_configured": bool(app.state.bailian_app_service.api_key and app.state.bailian_app_service.app_id),
+            "bailian_vision_configured": bool(app.state.bailian_vision_service.api_key and app.state.bailian_vision_service.app_id),
+            "bailian_qa_configured": bool(app.state.bailian_qa_service.api_key and app.state.bailian_qa_service.app_id),
             "vision_provider": app.state.vision_service.provider,
             "sessions": len(app.state.ai_sessions),
         }
@@ -440,7 +452,8 @@ def create_http_app(
 
             result = await run_camera_guide_test(
                 vision_service=app.state.vision_service,
-                bailian_app_service=app.state.bailian_app_service,
+                artifact_search=app.state.artifact_search,
+                photo_guide_service=app.state.photo_guide_service,
                 test_image_path=DEFAULT_CAMERA_TEST_IMAGE,
             )
             return JSONResponse(result, status_code=200 if result.get("ok") else 500)
@@ -449,8 +462,11 @@ def create_http_app(
     # 相机视觉分析
     # =========================================================================
 
-    async def analyze_camera_observation(safe_device: str, image_id: str, image_path: Path) -> VisionObservation:
-        """分析相机上传的图片并缓存结果。
+    async def analyze_camera_observation(safe_device: str, image_id: str, image_path: Path) -> VisualDescription:
+        """分析相机上传的图片，缓存视觉描述，并异步触发 KB 检索。
+
+        视觉分析和 KB 检索都在上传阶段完成，
+        用户提问时直接使用缓存结果，只需等待问答生成（~8s）。
 
         Args:
             safe_device: 设备标识
@@ -458,37 +474,65 @@ def create_http_app(
             image_path: 图片路径
 
         Returns:
-            VisionObservation: 视觉观察结果
+            VisualDescription: 纯视觉描述
         """
         vision_start = time.perf_counter()
         try:
-            observation = await asyncio.to_thread(app.state.vision_service.analyze_image, image_path)
-            status = "retake" if choose_mode(observation) == RETAKE_MODE else "ready"
+            desc = await asyncio.to_thread(app.state.vision_service.analyze_image, image_path)
+            status = "ready" if desc.is_clear and desc.category not in ("无法判断", "未知") else "retake"
             error = ""
         except Exception as exc:
             logger.exception("[CAMERA] 视觉识别失败 device=%s image_id=%s", safe_device, image_id)
-            observation = VisionObservation(reason=f"视觉识别异常：{exc}")
+            desc = VisualDescription(risk=f"视觉识别异常：{exc}", is_clear=False)
             status = "failed"
             error = str(exc)[:300]
 
-        # 缓存分析结果
-        app.state.latest_image_analysis[safe_device] = {
+        # 缓存视觉描述
+        cache_entry = {
             "image_id": image_id,
             "path": image_path,
             "time": datetime.now(),
             "status": status,
-            "observation": observation,
+            "description": desc,
+            "match": None,  # 待 KB 检索填充
             "error": error,
         }
+        app.state.latest_visual_descriptions[safe_device] = cache_entry
+        # 向后兼容
+        app.state.latest_image_analysis[safe_device] = cache_entry
+
         log(
-            f"[CAMERA] 视觉识别 image_id={image_id} status={status} "
-            f"best_candidate_id={observation.best_candidate_id} "
-            f"candidate_confidence={observation.candidate_confidence:.2f} "
-            f"category={observation.category} safe_answer_level={observation.safe_answer_level} "
-            f"retake={int(observation.need_retake)} selected_mode={choose_mode(observation)} "
+            f"[CAMERA] 视觉描述 image_id={image_id} status={status} "
+            f"category={desc.category} is_clear={desc.is_clear} "
+            f"confidence={desc.confidence:.2f} desc_len={len(desc.visual_description)} "
             f"cost={time.perf_counter() - vision_start:.3f}s"
         )
-        return observation
+
+        # 图片清晰且类别可辨时，立即做 KB 检索（用户拍照到提问间隙完成）
+        if status == "ready":
+            asyncio.create_task(_background_search(safe_device, image_id, desc, cache_entry))
+
+        return desc
+
+    async def _background_search(safe_device: str, image_id: str, desc: VisualDescription, cache_entry: dict) -> None:
+        """后台执行 KB 检索，结果写入缓存。
+
+        在上传阶段异步执行，不阻塞 HTTP 响应。
+        用户提问时直接读取缓存中的 match 结果。
+        """
+        search_start = time.perf_counter()
+        try:
+            match = await app.state.artifact_search.search_async(desc)
+        except Exception as exc:
+            logger.exception("[CAMERA] 后台KB检索失败 device=%s image_id=%s", safe_device, image_id)
+            match = ArtifactMatchResult(evidence=f"检索异常: {exc}")
+        cost = time.perf_counter() - search_start
+        cache_entry["match"] = match
+        log(
+            f"[CAMERA] 后台KB检索完成 device={safe_device} image_id={image_id} "
+            f"match_id={match.match_id} match_name={match.match_name} "
+            f"confidence={match.confidence:.2f} cost={cost:.3f}s"
+        )
 
     def is_latest_image_question(text: str) -> bool:
         """判断用户问题是否在询问最新拍摄的图片。
@@ -516,7 +560,8 @@ def create_http_app(
     async def answer_latest_image_question(safe_device: str) -> str:
         """回答关于最新图片的问题。
 
-        优先使用当前设备的分析缓存，fallback 到 walkie-01 的缓存。
+        KB 检索已在上传阶段后台完成，这里直接使用缓存结果，
+        用户只需等待问答生成（~8s），避免等待检索（+8s）。
 
         Args:
             safe_device: 设备标识
@@ -524,25 +569,32 @@ def create_http_app(
         Returns:
             str: 导游讲解文本
         """
-        cached = app.state.latest_image_analysis.get(safe_device)
-        # fallback：尝试使用默认设备的缓存
+        cached = app.state.latest_visual_descriptions.get(safe_device)
         if cached is None and safe_device != "walkie-01":
-            cached = app.state.latest_image_analysis.get("walkie-01")
+            cached = app.state.latest_visual_descriptions.get("walkie-01")
         if not isinstance(cached, dict):
             return "我还没有收到可以讲解的照片。你可以先拍一张展品，尽量让展品居中，再来问我。"
 
-        observation = cached.get("observation")
+        desc = cached.get("description")
         image_id = str(cached.get("image_id") or "")
-        if not isinstance(observation, VisionObservation):
+        if not isinstance(desc, VisualDescription):
             return "这张照片信息不太够。请把展品放在画面中间，靠近一点，避开展柜反光后重拍。"
 
+        # 取缓存的 KB 检索结果；若后台检索尚未完成则同步执行
+        match = cached.get("match")
+        if not isinstance(match, ArtifactMatchResult):
+            log(f"[CAMERA] 后台检索未完成，同步执行 device={safe_device} image_id={image_id}")
+            match = await app.state.artifact_search.search_async(desc)
+        log(
+            f"[CAMERA] 使用缓存检索结果 device={safe_device} image_id={image_id} "
+            f"match_id={match.match_id} match_name={match.match_name} confidence={match.confidence:.2f}"
+        )
+
         guide = await app.state.photo_guide_service.build_answer_async(
-            observation,
-            device=safe_device,
-            image_id=image_id,
+            desc, match, device=safe_device, image_id=image_id,
         )
         log(
-            f"[CAMERA] 语音使用缓存图片 device={safe_device} image_id={image_id} "
+            f"[CAMERA] 导游讲解 device={safe_device} image_id={image_id} "
             f"mode={guide.mode} grounded={int(guide.grounded)} answer_chars={len(guide.answer_text)}"
         )
         return guide.answer_text
@@ -898,11 +950,9 @@ def create_http_app(
         }
         log(f"Camera 最新图片已更新 device={safe_device} image_id={image_id} file={save_path}")
 
-        # 视觉分析和导游讲解
-        observation = await analyze_camera_observation(safe_device, image_id, save_path)
-        mode = choose_mode(observation)
-        analysis_ok = mode != RETAKE_MODE
-        data = observation.to_dict()
+        # 视觉分析（只输出视觉描述，不匹配文物）
+        desc = await analyze_camera_observation(safe_device, image_id, save_path)
+        need_retake = not desc.is_clear or desc.category in ("无法判断", "未知")
         response_data = {
             "ok": True,
             "len": len(body),
@@ -911,30 +961,19 @@ def create_http_app(
             "file": save_path.as_posix(),
             "device": safe_device,
             "image_id": image_id,
-            "analysis_ok": analysis_ok,
-            "mode": mode,
-            "best_candidate_id": data["best_candidate_id"],
-            "best_candidate_name": data["best_candidate_name"],
-            "candidate_confidence": data["candidate_confidence"],
-            "category": data["category"],
-            "top_candidates": data["top_candidates"],
-            "visible_features": data["visible_features"],
-            "visual_evidence": data["visual_evidence"],
-            "risk": data["risk"],
-            "safe_answer_level": data["safe_answer_level"],
-            "need_retake": data["need_retake"] or mode == RETAKE_MODE,
-            "grounded": False,
+            "category": desc.category,
+            "is_clear": desc.is_clear,
+            "confidence": desc.confidence,
+            "visual_description": desc.visual_description,
+            "shape_features": desc.shape_features,
+            "decoration_features": desc.decoration_features,
+            "color_material": desc.color_material,
+            "search_keywords": desc.search_keywords,
+            "risk": desc.risk,
+            "need_retake": need_retake,
             "answer_text": ""
-            if analysis_ok
+            if not need_retake
             else "这张照片信息不太够。请把展品放在画面中间，靠近一点，避开展柜反光后重拍。",
-            # 兼容旧版客户端/调试工具
-            "scene_type": data["scene_type"],
-            "object_category": data["object_category"],
-            "visual_features": data["visual_features"],
-            "readable_text": data["readable_text"],
-            "possible_subject": data["possible_subject"],
-            "category_confidence": data["category_confidence"],
-            "specific_name_confidence": data["specific_name_confidence"],
         }
         return JSONResponse(response_data)
 
@@ -974,24 +1013,33 @@ def create_http_app(
 
         image_id = str(latest.get("image_id") or image_path.stem)
 
-        # 优先使用缓存的分析结果
-        cached = app.state.latest_image_analysis.get(safe_device)
+        # 优先使用缓存的视觉描述 + KB检索结果
+        cached = app.state.latest_visual_descriptions.get(safe_device)
         if (
             isinstance(cached, dict)
             and cached.get("image_id") == image_id
-            and isinstance(cached.get("observation"), VisionObservation)
+            and isinstance(cached.get("description"), VisualDescription)
         ):
-            observation = cached["observation"]
-            log(f"[CAMERA] 使用缓存视觉结果 image_id={image_id} status={cached.get('status')}")
+            desc = cached["description"]
+            match = cached.get("match") if isinstance(cached.get("match"), ArtifactMatchResult) else None
+            log(f"[CAMERA] 使用缓存结果 image_id={image_id} has_match={match is not None}")
         else:
-            observation = await analyze_camera_observation(safe_device, image_id, image_path)
+            desc = await analyze_camera_observation(safe_device, image_id, image_path)
+            match = None
 
-        # 生成导游讲解
+        # KB 检索：优先用缓存，未完成则同步执行
+        if match is None:
+            search_start = time.perf_counter()
+            match = await app.state.artifact_search.search_async(desc)
+            log(
+                f"[CAMERA] KB检索(同步) image_id={image_id} "
+                f"match_id={match.match_id} confidence={match.confidence:.2f} "
+                f"cost={time.perf_counter() - search_start:.3f}s"
+            )
+
         guide_start = time.perf_counter()
         guide = await app.state.photo_guide_service.build_answer_async(
-            observation,
-            device=safe_device,
-            image_id=image_id,
+            desc, match, device=safe_device, image_id=image_id,
         )
         log(
             f"[CAMERA] 导游讲解 image_id={image_id} mode={guide.mode} grounded={int(guide.grounded)} "
@@ -1001,7 +1049,8 @@ def create_http_app(
             response_payload(
                 device=safe_device,
                 image_id=image_id,
-                observation=observation,
+                desc=desc,
+                match=match,
                 guide=guide,
             )
         )

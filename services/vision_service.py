@@ -1,14 +1,18 @@
 """视觉识别服务模块。
 
 基于多模态大模型（如 qwen-vl-plus）分析游客拍摄的展品图片，
-识别展品类别、匹配置信度，并输出结构化的视觉观察结果。
+输出纯视觉描述（VisualDescription），不猜测文物名称。
 
 核心流程：
 1. 图片预处理（中心裁剪 + 亮度/对比度增强）
-2. 发送给多模态大模型，与候选展品列表进行匹配
-3. 解析模型返回的 JSON，生成 VisionObservation 结构化结果
+2. 发送给多模态大模型，使用统一的视觉描述 prompt
+3. 解析模型返回的 JSON，生成 VisualDescription 结构化结果
 
-支持两种模式：
+两种输出模式：
+- VisualDescription（新）：纯视觉特征描述，用于知识库语义检索
+- VisionObservation（旧）：候选匹配结果，保留向后兼容
+
+支持两种 provider：
 - Mock 模式：根据文件名返回预设结果
 - DashScope 模式：调用阿里云多模态 API
 """
@@ -203,18 +207,64 @@ class VisionObservation:
         }
 
 
+@dataclass(frozen=True)
+class VisualDescription:
+    """视觉模型对一张图片的纯视觉描述。
+
+    知识库构建时：基准图 → 视觉模型 → VisualDescription → 存为知识库文档
+    用户查询时：  用户图 → 视觉模型 → VisualDescription → 发给百炼做语义匹配
+
+    Attributes:
+        category: 展品类别（玉器/陶瓷/青铜器/石器/书画/建筑构件/其他/无法判断）
+        visual_description: 核心字段，150-300字连贯视觉描述，语义匹配的主输入
+        shape_features: 形态特征列表
+        decoration_features: 纹饰特征列表
+        color_material: 颜色与材质列表
+        search_keywords: 检索关键词列表
+        is_clear: 图片是否清晰可辨
+        confidence: 模型自评置信度 (0.0~1.0)
+        risk: 不确定说明
+    """
+    category: str = "无法判断"
+    visual_description: str = ""
+    shape_features: list[str] = field(default_factory=list)
+    decoration_features: list[str] = field(default_factory=list)
+    color_material: list[str] = field(default_factory=list)
+    search_keywords: list[str] = field(default_factory=list)
+    is_clear: bool = True
+    confidence: float = 0.0
+    risk: str = ""
+
+    def to_search_text(self) -> str:
+        """拼合为知识库检索用的纯文本。"""
+        parts = [self.visual_description]
+        if self.shape_features:
+            parts.append("形态特征：" + " ".join(self.shape_features))
+        if self.decoration_features:
+            parts.append("纹饰特征：" + " ".join(self.decoration_features))
+        if self.color_material:
+            parts.append("颜色材质：" + " ".join(self.color_material))
+        if self.search_keywords:
+            parts.append("关键词：" + " ".join(self.search_keywords))
+        return "\n".join(parts)
+
+    def to_dict(self) -> dict[str, Any]:
+        """转为字典格式。"""
+        return asdict(self)
+
+
 class VisionService:
     """视觉识别服务。
 
     根据配置的 provider 调用对应的视觉模型，
-    分析展品图片并返回结构化的 VisionObservation。
+    分析展品图片并返回结构化的 VisualDescription（纯视觉描述）。
 
     Attributes:
         provider: 视觉服务提供商（dashscope 或 mock）
         model: 模型名称
-        candidates_path: 候选展品配置文件路径
+        candidates_path: 候选展品配置文件路径（向后兼容保留）
         preprocess_dir: 图片预处理输出目录
-        candidates: 已加载的展品候选列表
+        candidates: 已加载的展品候选列表（向后兼容保留）
     """
 
     def __init__(
@@ -242,23 +292,26 @@ class VisionService:
         self.candidates = load_vision_candidates(self.candidates_path)
         print(f"[VISION] 已加载视觉候选展品 count={len(self.candidates)} path={self.candidates_path}", flush=True)
 
-    def analyze_image(self, image_path: str | Path) -> VisionObservation:
-        """分析展品图片，返回结构化的视觉观察结果。
+    def analyze_image(self, image_path: str | Path) -> VisualDescription:
+        """分析展品图片，返回纯视觉描述。
+
+        知识库构建和用户查询使用完全相同的 prompt 和输出格式，
+        保证描述在同一语义空间，便于后续知识库检索。
 
         Args:
             image_path: 图片文件路径
 
         Returns:
-            VisionObservation: 视觉识别观察结果
+            VisualDescription: 纯视觉描述，不含文物名称猜测
 
         Raises:
             ValueError: 不支持的 VISION_PROVIDER
         """
         path = Path(image_path)
         if self.provider == "mock":
-            return _mock_observation(path)
+            return _mock_description(path)
         if self.provider == "dashscope":
-            return self._analyze_with_dashscope(path)
+            return self._analyze_description_with_dashscope(path)
         raise ValueError(f"不支持的 VISION_PROVIDER: {self.provider}")
 
     def analyze_for_guide_context(self, image_path: str | Path) -> dict[str, Any]:
@@ -281,20 +334,93 @@ class VisionService:
             return self._analyze_guide_context_with_dashscope(path)
         raise ValueError(f"不支持的 VISION_PROVIDER: {self.provider}")
 
-    def _analyze_with_dashscope(self, image_path: Path) -> VisionObservation:
-        """使用 DashScope 多模态模型分析展品图片。
+    def _analyze_description_with_dashscope(self, image_path: Path) -> VisualDescription:
+        """使用 DashScope 多模态模型分析图片，只输出视觉描述。
 
-        流程：
-        1. 图片预处理（裁剪 + 增强）
-        2. 构建候选匹配 prompt
-        3. 发送原始图 + 增强图给多模态模型
-        4. 解析返回的 JSON 为 VisionObservation
+        与旧版 _analyze_with_dashscope 的区别：
+        - 使用统一的视觉描述 prompt（不包含候选列表）
+        - 返回 VisualDescription（不含文物名称猜测）
 
         Args:
             image_path: 图片文件路径
 
         Returns:
-            VisionObservation: 结构化的观察结果
+            VisualDescription: 纯视觉描述
+        """
+        api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
+        if not api_key:
+            return VisualDescription(risk="DASHSCOPE_API_KEY 未配置", is_clear=False)
+        if not image_path.exists():
+            return VisualDescription(risk="图片不存在", is_clear=False)
+
+        import dashscope
+
+        dashscope.api_key = api_key
+        preprocess_path = preprocess_image_for_vision(image_path, self.preprocess_dir)
+        prompt = build_visual_description_prompt()
+        print(f"[VISION] 视觉描述 prompt 长度={len(prompt)}", flush=True)
+
+        content = []
+        if preprocess_path != image_path:
+            content.append({"image": _image_data_url(image_path)})
+            content.append({"image": _image_data_url(preprocess_path)})
+        else:
+            content.append({"image": _image_data_url(preprocess_path)})
+        content.append({"text": prompt})
+
+        response = dashscope.MultiModalConversation.call(
+            model=self.model,
+            messages=[{"role": "user", "content": content}],
+        )
+        response_data = _response_to_dict(response)
+        status_code = response_data.get("status_code", getattr(response, "status_code", None))
+        if status_code not in (None, 200):
+            message = response_data.get("message", getattr(response, "message", ""))
+            code = response_data.get("code", getattr(response, "code", ""))
+            return VisualDescription(
+                risk=f"视觉模型调用失败 status={status_code} code={code} message={message}",
+                is_clear=False,
+            )
+
+        text = _extract_response_text(response_data)
+        print(f"[VISION] 视觉描述原始响应={_preview_text(text, 1200)}", flush=True)
+        if not text:
+            return VisualDescription(risk="视觉模型返回为空", is_clear=False)
+        return parse_visual_description(text)
+
+    def analyze_for_guide_context(self, image_path: str | Path) -> dict[str, Any]:
+        """分析图片，返回导游上下文信息（用于知识库检索）。
+
+        现在直接复用 analyze_image() 的 VisualDescription 输出。
+
+        Args:
+            image_path: 图片文件路径
+
+        Returns:
+            dict: 包含 visual_summary、search_keywords 等字段的检索上下文
+        """
+        desc = self.analyze_image(image_path)
+        return {
+            "category": desc.category,
+            "object_type_guess": [],
+            "visual_summary": desc.visual_description[:80] if len(desc.visual_description) > 80 else desc.visual_description,
+            "shape_features": desc.shape_features,
+            "decoration_features": desc.decoration_features,
+            "search_keywords": desc.search_keywords,
+            "is_clear": desc.is_clear,
+            "confidence": desc.confidence,
+            "risk": desc.risk,
+            "visual_description": desc.visual_description,
+            "color_material": desc.color_material,
+        }
+
+    # ---- 向后兼容：保留旧方法供外部调用者过渡 ----
+
+    def _analyze_with_dashscope(self, image_path: Path) -> VisionObservation:
+        """[已废弃] 使用 DashScope 进行候选匹配分析。
+
+        保留此方法仅为向后兼容，新代码应使用 analyze_image() 返回的
+        VisualDescription + ArtifactSearchService 进行知识库检索。
         """
         api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
         if not api_key:
@@ -305,15 +431,12 @@ class VisionService:
         import dashscope
 
         dashscope.api_key = api_key
-        # 图片预处理
         preprocess_path = preprocess_image_for_vision(image_path, self.preprocess_dir)
         prompt = build_candidate_prompt(self.candidates)
         print(f"[VISION] 视觉候选 prompt 长度={len(prompt)}", flush=True)
 
-        # 构建多模态消息内容
         content = []
         if preprocess_path != image_path:
-            # 发送两张图：原图 + 中心裁剪增强图
             content.append({"image": _image_data_url(image_path)})
             content.append({"image": _image_data_url(preprocess_path)})
         else:
@@ -337,61 +460,74 @@ class VisionService:
             return VisionObservation(risk="视觉模型返回为空", reason="视觉模型返回为空")
         return parse_vision_observation(text, self.candidates)
 
-    def _analyze_guide_context_with_dashscope(self, image_path: Path) -> dict[str, Any]:
-        """使用 DashScope 分析图片用于导游上下文检索。
+def build_visual_description_prompt() -> str:
+    """构建视觉描述 prompt（知识库构建与用户查询通用）。
 
-        与 _analyze_with_dashscope 的区别：
-        - 使用不同的 prompt（侧重视觉描述而非展品匹配）
-        - 返回检索上下文字典而非 VisionObservation
+    知识库构建时和用户查询时使用完全相同的 prompt，
+    保证视觉描述在同一语义空间，便于后续语义检索匹配。
 
-        Args:
-            image_path: 图片文件路径
+    Returns:
+        str: 完整的 prompt 文本
+    """
+    return """你是一个博物馆文物视觉特征描述助手。请根据图片中可见的内容，输出结构化的视觉描述。
 
-        Returns:
-            dict: 导游检索上下文
+要求：
+1. 只描述视觉可见的内容：形态、颜色、材质质感、表面纹饰、特殊结构
+2. 不要编造年代、出土地、用途、历史故事、文物等级
+3. 不要猜测具体文物名称（除非图片中能看到说明牌文字）
+4. visual_description 是最重要字段，150-300字连贯描述，用于后续语义检索匹配
+5. 只输出 JSON，不要 Markdown 标记
 
-        Raises:
-            RuntimeError: API 调用失败
-            FileNotFoundError: 图片不存在
-            VisionJsonParseError: 返回 JSON 解析失败
-        """
-        api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
-        if not api_key:
-            raise RuntimeError("DASHSCOPE_API_KEY 未配置，无法调用视觉模型")
-        if not image_path.exists():
-            raise FileNotFoundError(f"图片不存在：{image_path}")
+输出 JSON 格式：
+{
+  "category": "玉器/陶瓷/青铜器/石器/书画/建筑构件/其他/无法判断",
+  "visual_description": "一段150-300字的连贯视觉描述，包括整体形态、结构比例、颜色、材质观感、表面纹饰细节、特殊部件。这是语义匹配的主字段。",
+  "shape_features": ["整体轮廓", "形态特征"],
+  "decoration_features": ["纹饰", "装饰"],
+  "color_material": ["颜色描述", "材质质感"],
+  "search_keywords": ["关键词1", "关键词2"],
+  "is_clear": true,
+  "confidence": 0.9,
+  "risk": "如有不确定的地方在此说明"
+}"""
 
-        import dashscope
 
-        dashscope.api_key = api_key
-        preprocess_path = preprocess_image_for_vision(image_path, self.preprocess_dir)
-        prompt = build_guide_context_prompt()
-        print(f"[VISION] 导游上下文 prompt 长度={len(prompt)}", flush=True)
+def parse_visual_description(text: str) -> VisualDescription:
+    """解析视觉模型的文本响应为 VisualDescription 对象。
 
-        content = []
-        if preprocess_path != image_path:
-            content.append({"image": _image_data_url(image_path)})
-            content.append({"image": _image_data_url(preprocess_path)})
-        else:
-            content.append({"image": _image_data_url(preprocess_path)})
-        content.append({"text": prompt})
+    Args:
+        text: 模型返回的文本（应包含 JSON）
 
-        response = dashscope.MultiModalConversation.call(
-            model=self.model,
-            messages=[{"role": "user", "content": content}],
-        )
-        response_data = _response_to_dict(response)
-        status_code = response_data.get("status_code", getattr(response, "status_code", None))
-        if status_code not in (None, 200):
-            message = response_data.get("message", getattr(response, "message", ""))
-            code = response_data.get("code", getattr(response, "code", ""))
-            raise RuntimeError(f"视觉模型调用失败 status={status_code} code={code} message={message}")
+    Returns:
+        VisualDescription: 结构化的视觉描述
+    """
+    data = _extract_json_object(text)
+    if not data:
+        return VisualDescription(risk="视觉模型返回非 JSON", is_clear=False)
 
-        text = _extract_response_text(response_data)
-        print(f"[VISION] 导游上下文原始响应={_preview_text(text, 1200)}", flush=True)
-        if not text:
-            raise VisionJsonParseError("视觉模型返回为空", raw_response="")
-        return parse_guide_context_result(text)
+    category = _clean_category(str(data.get("category") or "无法判断"))
+    visual_description = " ".join(str(data.get("visual_description") or "").strip().split())
+    if len(visual_description) > 300:
+        visual_description = visual_description[:300]
+
+    desc = VisualDescription(
+        category=category,
+        visual_description=visual_description,
+        shape_features=_str_list(data.get("shape_features"))[:10],
+        decoration_features=_str_list(data.get("decoration_features"))[:10],
+        color_material=_str_list(data.get("color_material"))[:10],
+        search_keywords=_str_list(data.get("search_keywords"))[:10],
+        is_clear=bool(data.get("is_clear", True)),
+        confidence=_clamp_float(data.get("confidence"), 0.0),
+        risk=str(data.get("risk") or "").strip(),
+    )
+    print(
+        f"[VISION] VisualDescription category={desc.category} "
+        f"is_clear={desc.is_clear} confidence={desc.confidence:.2f} "
+        f"desc_len={len(desc.visual_description)} keywords={len(desc.search_keywords)}",
+        flush=True,
+    )
+    return desc
 
 
 class VisionJsonParseError(ValueError):
@@ -598,7 +734,7 @@ def preprocess_image_for_vision(image_path: Path, preprocess_dir: Path = DEFAULT
 
 
 def describe_image(image_path: str | Path) -> str:
-    """分析单张图片并返回 JSON 格式的描述。
+    """分析单张图片并返回 JSON 格式的视觉描述。
 
     便捷函数，内部创建 VisionService 并调用 analyze_image。
 
@@ -606,10 +742,10 @@ def describe_image(image_path: str | Path) -> str:
         image_path: 图片文件路径
 
     Returns:
-        str: JSON 格式的视觉观察结果
+        str: JSON 格式的 VisualDescription
     """
-    observation = VisionService().analyze_image(image_path)
-    return json.dumps(observation.to_dict(), ensure_ascii=False)
+    desc = VisionService().analyze_image(image_path)
+    return json.dumps(desc.to_dict(), ensure_ascii=False)
 
 
 def parse_vision_observation(text: str, candidates: list[MuseumVisionCandidate] | None = None) -> VisionObservation:
@@ -973,6 +1109,61 @@ def _preview_text(text: str, limit: int) -> str:
     if len(normalized) <= limit:
         return normalized
     return f"{normalized[:limit]}..."
+
+
+def _mock_description(image_path: Path) -> VisualDescription:
+    """Mock 模式：根据文件名返回预设的 VisualDescription。
+
+    用于开发测试，不需要实际调用 API。
+    """
+    name = image_path.name.lower()
+    if "blur" in name or "retake" in name:
+        return VisualDescription(
+            category="无法判断",
+            visual_description="画面较模糊，主体展品轮廓和材质不清。",
+            shape_features=[],
+            decoration_features=[],
+            color_material=[],
+            search_keywords=["展品", "模糊", "无法判断"],
+            is_clear=False,
+            confidence=0.2,
+            risk="mock 模糊图片",
+        )
+    if "yu" in name or "ying" in name or "eagle" in name:
+        return VisualDescription(
+            category="玉器",
+            visual_description="该文物为一件玉质雕刻品，整体呈展翼鹰形，双翼对称向左右两侧展开，边缘圆润。材质为浅黄至米白色玉石，表面打磨光滑，局部可见自然褐色沁色。鹰首位于中央偏上，喙部短而尖锐，身体以流畅的线刻表现羽毛层次，线条深浅不一。",
+            shape_features=["展翼鹰形", "双翼对称展开", "扁平器物", "喙部尖锐"],
+            decoration_features=["线刻羽毛纹", "线条流畅"],
+            color_material=["浅黄至米白色", "玉石", "表面光滑莹润", "褐色沁色"],
+            search_keywords=["玉器", "鹰形", "线刻", "扁平", "应国"],
+            is_clear=True,
+            confidence=0.72,
+            risk="mock 图片细节不够清楚",
+        )
+    if "bronze" in name or "tong" in name or "gui" in name:
+        return VisualDescription(
+            category="青铜器",
+            visual_description="这件青铜器整体造型庄重古朴，器身表面覆盖着复杂的几何纹饰和兽面纹，纹路深邃且富有层次感。表面呈现深绿色铜锈，质感厚重。器身两侧有环形耳，底部为三足结构。",
+            shape_features=["圆形器身", "环形耳", "三足底座"],
+            decoration_features=["几何纹样", "兽面纹", "弦纹"],
+            color_material=["深绿色铜锈", "青铜材质", "金属质感"],
+            search_keywords=["青铜器", "三足", "纹饰", "礼器"],
+            is_clear=True,
+            confidence=0.65,
+            risk="mock 默认青铜器描述",
+        )
+    return VisualDescription(
+        category="陶瓷",
+        visual_description="展柜中可见一件器物，轮廓较圆润，表面有浅色反光。器身主体为深色釉面，口沿外缘呈花瓣状波浪形，底部有三足支撑。",
+        shape_features=["圆润轮廓", "花瓣状口沿", "三足"],
+        decoration_features=["深色釉面", "表面反光"],
+        color_material=["深色釉", "浅色反光"],
+        search_keywords=["陶瓷", "器物", "展柜", "三足"],
+        is_clear=True,
+        confidence=0.65,
+        risk="mock 默认陶瓷描述",
+    )
 
 
 def _mock_observation(image_path: Path) -> VisionObservation:
