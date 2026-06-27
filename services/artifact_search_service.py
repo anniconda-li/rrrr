@@ -1,25 +1,32 @@
 """文物检索服务模块。
 
-桥接视觉描述（VisualDescription）与百炼知识库检索，
-将视觉描述文本发送到百炼视觉检索应用，解析返回的匹配结果。
+桥接视觉描述（VisualDescription）与文物候选库，
+优先在本地对少量重点展品做视觉特征匹配，必要时回退到百炼知识库检索。
 
 核心流程：
-1. 从 VisualDescription 构建检索 prompt
-2. 调用百炼视觉检索应用（挂视觉指纹知识库）
-3. 解析返回的 JSON → ArtifactMatchResult
-4. 根据匹配置信度决定后续讲解策略
+1. 从 VisualDescription 拼合本地检索文本
+2. 与 museum_vision_candidates.json 的视觉特征、别名、同义词打分
+3. 高置信度直接返回 ArtifactMatchResult
+4. 低置信度时可按配置回退百炼视觉检索应用
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
+from core.paths import KNOWLEDGE_CONFIG_DIR
 from services.bailian_app_service import BailianAppService
 from services.vision_service import VisualDescription
+
+DEFAULT_CANDIDATES_PATH = KNOWLEDGE_CONFIG_DIR / "museum_vision_candidates.json"
+DEFAULT_LOCAL_MIN_CONFIDENCE = 0.58
+DEFAULT_LOCAL_MIN_MARGIN = 0.08
 
 
 @dataclass(frozen=True)
@@ -40,6 +47,7 @@ class ArtifactMatchResult:
     confidence: float = 0.0
     evidence: str = ""
     raw_response: str = ""
+    provider: str = ""
 
     @property
     def is_matched(self) -> bool:
@@ -61,13 +69,21 @@ class ArtifactSearchService:
         bailian: 百炼视觉检索应用服务实例
     """
 
-    def __init__(self, bailian_vision_service: BailianAppService):
+    def __init__(
+        self,
+        bailian_vision_service: BailianAppService,
+        *,
+        candidates_path: Path = DEFAULT_CANDIDATES_PATH,
+    ):
         """初始化文物检索服务。
 
         Args:
             bailian_vision_service: 百炼视觉检索应用实例（挂视觉指纹知识库）
+            candidates_path: 本地候选展品配置文件路径
         """
         self.bailian = bailian_vision_service
+        self.candidates_path = candidates_path
+        self.candidates = self._load_candidates(candidates_path)
 
     def search(self, desc: VisualDescription) -> ArtifactMatchResult:
         """同步检索最匹配的文物。
@@ -100,6 +116,45 @@ class ArtifactSearchService:
             ArtifactMatchResult: 匹配结果
         """
         total_start = time.perf_counter()
+        provider = os.getenv("ARTIFACT_SEARCH_PROVIDER", "local").strip().lower() or "local"
+        min_confidence = _env_float("ARTIFACT_LOCAL_MIN_CONFIDENCE", DEFAULT_LOCAL_MIN_CONFIDENCE)
+        min_margin = _env_float("ARTIFACT_LOCAL_MIN_MARGIN", DEFAULT_LOCAL_MIN_MARGIN)
+
+        local_result, runner_up = self._search_local(desc)
+        margin = local_result.confidence - runner_up.confidence
+        print(
+            f"[SEARCH-LOCAL] match_id={local_result.match_id} match_name={local_result.match_name} "
+            f"confidence={local_result.confidence:.2f} runner_up={runner_up.match_id}:{runner_up.confidence:.2f} "
+            f"margin={margin:.2f} provider={provider}",
+            flush=True,
+        )
+
+        if provider == "local":
+            print(
+                f"[SEARCH] provider=local match_id={local_result.match_id} "
+                f"match_name={local_result.match_name} confidence={local_result.confidence:.2f} "
+                f"cost={time.perf_counter() - total_start:.3f}s",
+                flush=True,
+            )
+            return local_result
+
+        if provider == "hybrid" and local_result.confidence >= min_confidence and margin >= min_margin:
+            print(
+                f"[SEARCH] provider=hybrid-local match_id={local_result.match_id} "
+                f"match_name={local_result.match_name} confidence={local_result.confidence:.2f} "
+                f"cost={time.perf_counter() - total_start:.3f}s",
+                flush=True,
+            )
+            return local_result
+
+        if provider not in {"bailian", "hybrid"}:
+            print(f"[SEARCH] 未知 ARTIFACT_SEARCH_PROVIDER={provider!r}，使用本地结果", flush=True)
+            return local_result
+
+        return await self._search_bailian(desc, total_start)
+
+    async def _search_bailian(self, desc: VisualDescription, total_start: float) -> ArtifactMatchResult:
+        """调用百炼视觉检索应用。"""
         prompt = self._build_search_prompt(desc)
         print(f"[SEARCH] 检索 prompt 长度={len(prompt)}", flush=True)
 
@@ -110,6 +165,14 @@ class ArtifactSearchService:
             return ArtifactMatchResult(evidence=f"检索调用异常: {exc}")
 
         result = self._parse_response(response)
+        result = ArtifactMatchResult(
+            match_id=result.match_id,
+            match_name=result.match_name,
+            confidence=result.confidence,
+            evidence=result.evidence,
+            raw_response=result.raw_response,
+            provider="bailian",
+        )
         print(
             f"[SEARCH] match_id={result.match_id} match_name={result.match_name} "
             f"confidence={result.confidence:.2f} cost={time.perf_counter() - total_start:.3f}s",
@@ -156,6 +219,124 @@ class ArtifactSearchService:
         parts.append('无匹配返回：{"match_id":"none","match_name":"无","confidence":0.0,"evidence":"知识库中无匹配的视觉描述"}')
 
         return "\n".join(parts)
+
+    def _load_candidates(self, path: Path) -> list[dict[str, Any]]:
+        """加载本地候选展品配置。"""
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"[SEARCH-LOCAL] 候选配置加载失败 path={path} error={exc}", flush=True)
+            return []
+        if not isinstance(data, list):
+            print(f"[SEARCH-LOCAL] 候选配置不是列表 path={path}", flush=True)
+            return []
+        candidates = [item for item in data if isinstance(item, dict)]
+        print(f"[SEARCH-LOCAL] 已加载候选展品 count={len(candidates)} path={path}", flush=True)
+        return candidates
+
+    def _search_local(self, desc: VisualDescription) -> tuple[ArtifactMatchResult, ArtifactMatchResult]:
+        """基于少量候选展品的本地视觉特征打分。"""
+        if not self.candidates:
+            return (
+                ArtifactMatchResult(evidence="本地候选配置为空", provider="local"),
+                ArtifactMatchResult(provider="local"),
+            )
+
+        query_text = _normalize_text(
+            "\n".join(
+                [
+                    desc.category,
+                    desc.visual_description,
+                    " ".join(desc.shape_features),
+                    " ".join(desc.decoration_features),
+                    " ".join(desc.color_material),
+                    " ".join(desc.search_keywords),
+                ]
+            )
+        )
+
+        scored = [self._score_candidate(desc, query_text, candidate) for candidate in self.candidates]
+        scored.sort(key=lambda item: item[0].confidence, reverse=True)
+        best = scored[0][0]
+        runner_up = scored[1][0] if len(scored) > 1 else ArtifactMatchResult(provider="local")
+        if best.confidence < _env_float("ARTIFACT_LOCAL_ABS_MIN_CONFIDENCE", 0.35):
+            return (
+                ArtifactMatchResult(
+                    evidence=f"本地匹配置信度过低，最佳候选 {best.match_name}={best.confidence:.2f}",
+                    provider="local",
+                ),
+                runner_up,
+            )
+        return best, runner_up
+
+    def _score_candidate(
+        self,
+        desc: VisualDescription,
+        query_text: str,
+        candidate: dict[str, Any],
+    ) -> tuple[ArtifactMatchResult, list[str]]:
+        """对单个候选展品打分。"""
+        score = 0.0
+        evidence: list[str] = []
+        category = str(candidate.get("category") or "").strip()
+
+        if desc.category and desc.category not in {"无法判断", "未知"}:
+            if category == desc.category:
+                score += 0.24
+                evidence.append(f"类别匹配:{category}")
+            else:
+                score -= 0.18
+
+        for term in _candidate_terms(candidate, ("standard_name", "name")):
+            if _term_matches(query_text, term):
+                score += 0.20
+                evidence.append(f"名称:{term}")
+
+        for term in _candidate_terms(candidate, ("aliases",)):
+            if _term_matches(query_text, term):
+                score += 0.16
+                evidence.append(f"别名:{term}")
+
+        for term in _candidate_terms(candidate, ("visual_features",)):
+            if _term_matches(query_text, term):
+                score += 0.14
+                evidence.append(f"视觉:{term}")
+
+        for term in _candidate_terms(candidate, ("local_match_terms",)):
+            if _term_matches(query_text, term):
+                score += 0.12
+                evidence.append(f"同义:{term}")
+
+        for term in _candidate_terms(candidate, ("kb_keywords",)):
+            if _term_matches(query_text, term):
+                score += 0.07
+                evidence.append(f"关键词:{term}")
+
+        for term in _candidate_terms(candidate, ("negative_terms",)):
+            if _term_matches(query_text, term):
+                score -= 0.22
+                evidence.append(f"排除:{term}")
+
+        try:
+            priority = float(candidate.get("priority") or 0)
+        except (TypeError, ValueError):
+            priority = 0.0
+        score += min(max(priority, 0.0), 100.0) / 1000.0
+
+        confidence = max(0.0, min(score, 0.98))
+        match_id = str(candidate.get("id") or "none").strip() or "none"
+        match_name = str(candidate.get("standard_name") or candidate.get("name") or "无").strip() or "无"
+        evidence_text = "；".join(evidence[:8]) if evidence else "未命中明确视觉特征"
+        return (
+            ArtifactMatchResult(
+                match_id=match_id,
+                match_name=match_name,
+                confidence=confidence,
+                evidence=evidence_text,
+                provider="local",
+            ),
+            evidence,
+        )
 
     def _parse_response(self, text: str) -> ArtifactMatchResult:
         """解析百炼视觉检索应用的响应。
@@ -218,4 +399,47 @@ class ArtifactSearchService:
             confidence=confidence,
             evidence=evidence,
             raw_response=text,
+            provider="bailian",
         )
+
+
+def _env_float(name: str, default: float) -> float:
+    """读取浮点环境变量。"""
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_text(text: str) -> str:
+    """归一化中文检索文本。"""
+    return re.sub(r"\s+", "", (text or "").lower())
+
+
+def _candidate_terms(candidate: dict[str, Any], keys: tuple[str, ...]) -> list[str]:
+    """从候选配置里提取检索词。"""
+    terms: list[str] = []
+    for key in keys:
+        value = candidate.get(key)
+        if isinstance(value, str):
+            terms.append(value)
+        elif isinstance(value, list):
+            terms.extend(str(item) for item in value if str(item).strip())
+    return terms
+
+
+def _term_matches(query_text: str, term: str) -> bool:
+    """判断一个候选特征词是否命中视觉描述。"""
+    normalized = _normalize_text(term)
+    if not normalized:
+        return False
+    if normalized in query_text:
+        return True
+    parts = [
+        part
+        for part in re.split(r"[、，,;/；\s]|或|和|与|及", normalized)
+        if len(part) >= 2
+    ]
+    if parts and any(part in query_text for part in parts):
+        return True
+    return False
